@@ -37,18 +37,18 @@ Layout after Fig. 1 of the report, made 3D (beam travels in +z, all lengths in m
 
 ## The knobs (`SEMSettings`)
 
-| knob | what it does | aberration it produces |
-|---|---|---|
-| `defocus_um` | moves the specimen stage | defocus (C_df) |
-| `obj_strength` | objective curvature multiplier (≈ lens current) | defocus |
-| `aperture_radius_mm` | aperture size | spherical aberration grows ~r³ |
-| `aperture_shift_x/y_mm` | off-centre aperture | coma-like asymmetric probe |
-| `stig_x`, `stig_y` | stigmator quadrupole [1/mm] | two-fold astigmatism (A1) |
-| `obj_tilt_x/y_mrad`, `obj_shift_x/y_mm` | misaligned objective | coma (B2), probe shift |
-| `c1_strength`, `c2_strength` | condenser currents | beam convergence → focus shift, spot size |
-| `bandwidth_nm` | spectral width of the source (glass dispersion) | chromatic aberration (≈ Cc with energy spread) |
-| `source_radius_um` | source size | geometric blur (≈ d50,geo) |
-| `scan_x/y_mm` | where the probe is sent | off-axis coma, astigmatism, field curvature, distortion |
+| knob                                    | what it does                                    | aberration it produces                                  |
+|-----------------------------------------|-------------------------------------------------|---------------------------------------------------------|
+| `defocus_um`                            | moves the specimen stage                        | defocus (C_df)                                          |
+| `obj_strength`                          | objective curvature multiplier (≈ lens current) | defocus                                                 |
+| `aperture_radius_mm`                    | aperture size                                   | spherical aberration grows ~r³                          |
+| `aperture_shift_x/y_mm`                 | off-centre aperture                             | coma-like asymmetric probe                              |
+| `stig_x`, `stig_y`                      | stigmator quadrupole [1/mm]                     | two-fold astigmatism (A1)                               |
+| `obj_tilt_x/y_mrad`, `obj_shift_x/y_mm` | misaligned objective                            | coma (B2), probe shift                                  |
+| `c1_strength`, `c2_strength`            | condenser currents                              | beam convergence → focus shift, spot size               |
+| `bandwidth_nm`                          | spectral width of the source (glass dispersion) | chromatic aberration (≈ Cc with energy spread)          |
+| `source_radius_um`                      | source size                                     | geometric blur (≈ d50,geo)                              |
+| `scan_x/y_mm`                           | where the probe is sent                         | off-axis coma, astigmatism, field curvature, distortion |
 
 ## What comes out
 
