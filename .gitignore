@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# generated PSF datasets are large (10k samples ~ 1 GB); regenerate with Data_PSF_Generator.py
+Wave_PSF_CNN/Data/
