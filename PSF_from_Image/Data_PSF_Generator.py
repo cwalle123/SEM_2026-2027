@@ -1,199 +1,318 @@
-"""This file generates the PSF dataset for the CNN (random aberrations -> through-focus PSF stacks)
-   and loads it back."""
-
-#################################################################################################################################################################
-"""Imports"""
-
 # External imports
-import argparse
 import json
-import os
-import time
+from pathlib import Path
 import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image   # Pillow (installed with matplotlib), used to save 16-bit PNG images
 
 # Internal imports
-from constants import (COEFF_NAMES, COEFF_RANGES, MACHINE_RANGES, DEFOCUS_OFFSETS, N_PIXELS, PIXEL_SIZE,
-                       N_SAMPLES, DATASET_NAME, BATCH_SIZE, MIN_CONTAINED, SEED, DATA_FOLDER,
-                       VOLTAGE, THETA, D50_GEO, BIN_FACTOR, PAD_FACTOR)
-from Model_PSF_Wave_Optics import psf_stack
 
-#################################################################################################################################################################
-"""Info"""
+#########################################################################################################
+"""Constants"""
 
-# Workflow (main):
-#   1. Draw random aberration coefficients (uniform within COEFF_RANGES) and machine settings
-#      (within MACHINE_RANGES) for a batch of samples.
-#   2. Make the through-focus PSF stack of every sample (Model_PSF_Wave_Optics.psf_stack).
-#   3. Throw away samples whose PSF does not fit in the stored window (less than MIN_CONTAINED of
-#      the beam current inside, in any plane) and draw new ones, so every stored PSF is complete.
-#   4. Save, and repeat until there are enough samples.
-#
-# Usage:
-#   python Data_PSF_Generator.py                      # N_SAMPLES samples -> Data/psf_v1
-#   python Data_PSF_Generator.py --n 500 --name test  # small test set -> Data/test
-#
-# What is saved in Data/<name>/ (plain .npy files, read them with load_dataset below):
-#   images.npy     (N, planes, 128, 128)  float16   every image scaled to a peak of 1
-#   scales.npy     (N, planes)            float32   the peak value of every image, so
-#                                                   images * scales = fraction of the beam current per pixel
-#   coeffs.npy     (N, 10)                float64   aberration coefficients (m), order = COEFF_NAMES
-#   machine.npy    (N, 3)                 float64   voltage (V), theta (rad), d50_geo (m) per sample
-#   contained.npy  (N, planes)            float32   fraction of the beam current inside the window
-#   meta.json                                       all settings used, so the dataset explains itself
-#
-# The images are stored as float16 (half the disk space); scaling every image to a peak of 1
-# first keeps them accurate, since float16 loses precision for very small numbers.
+# Default simulation settings (used by main(), can be overridden in generate_psf())
+N_PIXELS   = 1024    # PSF grid size: N_PIXELS x N_PIXELS
+ZERO_PAD   = 5       # zero-padding factor (>= 1, sensible up to ~15). Larger = finer PSF pixels
+HALF_ANGLE = 0.015   # beam half opening angle (convergence semi-angle) [rad]
+VOLTAGE    = 30000   # accelerating voltage [V]
+D50_GEO    = 1e-9    # geometric probe size (source image): diameter containing 50% of the current [m]
 
-#################################################################################################################################################################
+# Relativistic electron wavelength: lambda = 1.226e-9 / sqrt(U * (1 + 9.785e-7 * U)), with U in volts
+WAVELENGTH_CONST  = 1.226e-9   # [m * V^0.5]
+RELATIVISTIC_CORR = 9.785e-7   # [1/V]
+
+# Training data settings
+N_SAMPLES   = 1000                                                   # number of PSFs to generate
+DATA_FOLDER = Path(__file__).resolve().parent / "Data" / "PSF_data"  # output folder, next to this file
+LABEL_NAMES = ["C1", "A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3", "A3r", "A3i"]  # order of the aberration vector
+
+# Maximum size of each aberration when drawing random training data [m]
+# (based on the typical values noted in WavePSF0.py, adjust to match your microscope)
+ABERRATION_RANGES = {"C1": 0.5e-6,   # defocus
+                     "A1": 1e-8,     # 2-fold astigmatism
+                     "B2": 1e-6,     # axial coma
+                     "A2": 10e-6,    # 3-fold astigmatism
+                     "C3": 1e-3,     # spherical aberration
+                     "A3": 1e-4}     # 4-fold astigmatism
+
+#########################################################################################################
 """Functions"""
 
-def sample_uniform(rng, ranges, names, n):
+def electron_wavelength(voltage):
     """
-    Draw n random values for every quantity in names, each uniformly within its range.
+    Compute the relativistic wavelength of an electron.
 
-    rng    : numpy random generator
-    ranges : dict name -> (low, high)
-    names  : the names to draw, in this order
-    n      : number of samples
+    Args:
+        voltage (float): accelerating voltage [V].
 
-    Returns array (n, len(names)).
+    Returns:
+        float: electron wavelength [m].
     """
-    low = np.array([ranges[name][0] for name in names])
-    high = np.array([ranges[name][1] for name in names])
-    return low + rng.random((n, len(names))) * (high - low)
+    corrected_voltage = voltage * (1 + RELATIVISTIC_CORR * voltage)
+    return WAVELENGTH_CONST / np.sqrt(corrected_voltage)
 
-def generate_dataset(folder, n_samples, seed=SEED):
+
+def make_aberration_vector(C1=0.0, A1=0j, B2=0j, A2=0j, C3=0.0, A3=0j):
     """
-    Generate a dataset and save it in folder (see the Info section for the files).
+    Pack the 6 aberration coefficients into a single numpy vector.
 
-    folder    : folder to save in (made if it does not exist)
-    n_samples : number of samples to store
-    seed      : random seed
+    Non-round aberrations have a size and a direction, so they are given as complex numbers
+    (real part = x component, imaginary part = y component), e.g. A1 = 5e-9 + 2e-9j.
 
-    Returns the fraction of drawn samples that had to be redrawn because they did not fit.
+    Args:
+        C1 (float):   defocus [m].
+        A1 (complex): two-fold astigmatism [m].
+        B2 (complex): axial coma [m].
+        A2 (complex): three-fold astigmatism [m].
+        C3 (float):   spherical aberration, Cs [m].
+        A3 (complex): four-fold astigmatism [m].
+
+    Returns:
+        np.ndarray: length-10 float vector
+                    [C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i]
+                    (same ordering as the `aber` array in WavePSF0.py).
     """
-    os.makedirs(folder, exist_ok=True)
-    n_planes = len(DEFOCUS_OFFSETS)
-    machine_names = list(MACHINE_RANGES)
+    A1, B2, A2, A3 = complex(A1), complex(B2), complex(A2), complex(A3)
+    return np.array([C1,
+                     A1.real, A1.imag,
+                     B2.real, B2.imag,
+                     A2.real, A2.imag,
+                     C3,
+                     A3.real, A3.imag])
 
-    # The arrays are written straight to disk (memory-mapped), so a big dataset never has to fit in memory
-    images = np.lib.format.open_memmap(os.path.join(folder, 'images.npy'), mode='w+',
-                                       dtype=np.float16, shape=(n_samples, n_planes, N_PIXELS, N_PIXELS))
-    scales = np.zeros((n_samples, n_planes), dtype=np.float32)
-    coeffs = np.zeros((n_samples, 10))
-    machine = np.zeros((n_samples, 3))
-    contained = np.zeros((n_samples, n_planes), dtype=np.float32)
 
+def aberration_function(ax, ay, theta, aber):
+    """
+    Compute the wave aberration W (the optical path difference) at each beam angle.
+
+    The coma and spherical terms are balanced against lower orders in the same way as
+    Zernike polynomials (see Born & Wolf, Principles of Optics), exactly as in WavePSF0.py.
+
+    Args:
+        ax (np.ndarray): beam angle in x [rad].
+        ay (np.ndarray): beam angle in y [rad].
+        theta (float):   half opening angle, i.e. the angle at the aperture edge [rad].
+        aber (np.ndarray): aberration vector from make_aberration_vector().
+
+    Returns:
+        np.ndarray: wave aberration W(ax, ay) [m], same shape as ax.
+    """
+    C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i = aber
+    r2  = ax**2 + ay**2   # squared angle from the optical axis
+    th2 = theta**2
+
+    W  = 0.5 * C1 * r2                                                        # defocus
+    W += 0.5 * A1r * (ax**2 - ay**2) + A1i * ax * ay                          # 2-fold astigmatism
+    W += (B2r * ax - B2i * ay) * (r2 - (2/3) * th2)                           # axial coma
+    W += A2r * ax * (ax**2 / 3 - ay**2) + A2i * ay * (ax**2 - ay**2 / 3)      # 3-fold astigmatism
+    W += 0.25 * C3 * r2 * (r2 - th2)                                          # spherical aberration
+    W += A3r * (ax**4 + ay**4 - 6 * ax**2 * ay**2) + A3i * 4 * ax * ay * (ax**2 - ay**2)  # 4-fold astigmatism
+    return W
+
+
+def generate_psf(aber, n=N_PIXELS, zpf=ZERO_PAD, voltage=VOLTAGE, theta=HALF_ANGLE, d50geo=D50_GEO):
+    """
+    Simulate the wave-optical probe PSF of an SEM (chromatic aberration not included).
+
+    Steps:
+        1. Build the pupil (aperture) function: a disc with phase exp(i * k * W).
+        2. Fourier transform it to get the probe wavefunction; its intensity is the PSF.
+        3. Blur with a Gaussian to account for the finite source size (d50geo).
+
+    Args:
+        aber (np.ndarray): aberration vector from make_aberration_vector().
+        n (int):           PSF grid size (n x n pixels).
+        zpf (float):       zero-padding factor (>= 1). Sets the PSF pixel size.
+        voltage (float):   accelerating voltage [V].
+        theta (float):     half opening angle [rad].
+        d50geo (float):    geometric probe size (50% diameter) [m]. Use 0 for no source blur.
+
+    Returns:
+        psf (np.ndarray):   n x n PSF, centred in the array, normalised to a peak of 1.
+        otf (np.ndarray):   n x n complex OTF, zero frequency at [0, 0], normalised so otf[0, 0] = 1.
+        pixel_size (float): size of one PSF pixel [m].
+    """
+    assert zpf >= 1, "zero pad factor must be >= 1"
+
+    # Basic optics quantities
+    wavelength = electron_wavelength(voltage)
+    k = 2 * np.pi / wavelength                    # wave number [1/m]
+    pixel_size = wavelength / (2 * zpf * theta)   # PSF pixel size [m]
+
+    # Pupil-plane grid: the aperture is a disc of radius n/(2*zpf) pixels in the middle of the grid,
+    # the rest is zeros ("zero padding"), which is what sets the PSF pixel size above
+    centre = n // 2
+    aperture_radius_px = n / (2 * zpf)
+    angle_per_px = theta / aperture_radius_px     # beam angle covered by one pupil pixel [rad]
+    rows, cols = np.indices((n, n))
+    x_px = cols - centre
+    y_px = rows - centre
+    inside_aperture = x_px**2 + y_px**2 <= aperture_radius_px**2
+
+    # Pupil function: unit amplitude inside the aperture, phase = k * W
+    W = aberration_function(x_px * angle_per_px, y_px * angle_per_px, theta, aber)
+    pupil = np.where(inside_aperture, np.exp(1j * k * W), 0)
+
+    # Probe wavefunction = Fourier transform of the pupil, PSF = its intensity
+    psf = np.abs(np.fft.fft2(pupil))**2
+    psf /= psf.sum()
+    otf = np.fft.fft2(psf)
+
+    # Finite source size: convolving the PSF with a Gaussian = multiplying the OTF by a Gaussian
+    if d50geo > 0:
+        # A 2D Gaussian with standard deviation sigma has 50% of its intensity within d50 = sigma * sqrt(8 ln 2)
+        sigma_px = d50geo / (pixel_size * np.sqrt(8 * np.log(2)))
+        f = np.fft.fftfreq(n)                     # spatial frequencies [cycles/pixel], zero at index 0
+        f2 = f[:, None]**2 + f[None, :]**2
+        otf *= np.exp(-2 * np.pi**2 * sigma_px**2 * f2)
+        psf = np.abs(np.fft.ifft2(otf))
+
+    # Move the PSF peak from [0, 0] to the centre of the array and normalise to a peak of 1
+    psf = np.fft.fftshift(psf) / psf.max()
+    return psf, otf, pixel_size
+
+
+def plot_psf(psf, pixel_size, fov_nm=None, title="Simulated PSF"):
+    """
+    Show a PSF as an image together with its horizontal and vertical cross-sections.
+
+    Args:
+        psf (np.ndarray):   centred PSF from generate_psf().
+        pixel_size (float): PSF pixel size [m].
+        fov_nm (float):     width of the region to show [nm]. None shows the full PSF.
+        title (str):        figure title.
+    """
+    n = psf.shape[0]
+    centre = n // 2
+    coords_nm = (np.arange(n) - centre) * pixel_size * 1e9   # pixel positions [nm], 0 at the centre
+    half_width = coords_nm[-1] if fov_nm is None else fov_nm / 2
+
+    fig, (ax_img, ax_cut) = plt.subplots(1, 2, figsize=(11, 5))
+    fig.suptitle(title)
+
+    # PSF image
+    extent = [coords_nm[0], coords_nm[-1], coords_nm[-1], coords_nm[0]]
+    im = ax_img.imshow(psf, cmap="gray", extent=extent)
+    ax_img.set_xlim(-half_width, half_width)
+    ax_img.set_ylim(half_width, -half_width)
+    ax_img.set_xlabel("x [nm]")
+    ax_img.set_ylabel("y [nm]")
+    fig.colorbar(im, ax=ax_img, fraction=0.046)
+
+    # Cross-sections through the centre
+    ax_cut.plot(coords_nm, psf[centre, :], "b-", label="x (horizontal)")
+    ax_cut.plot(coords_nm, psf[:, centre], "r-", label="y (vertical)")
+    ax_cut.set_xlim(-half_width, half_width)
+    ax_cut.set_xlabel("position [nm]")
+    ax_cut.set_ylabel("intensity (peak = 1)")
+    ax_cut.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def random_aberration_vector(rng, ranges=ABERRATION_RANGES):
+    """
+    Draw a random aberration vector containing all 6 aberrations.
+
+    Each component is drawn uniformly from [-max, +max], except spherical aberration (C3),
+    which is drawn from [0, max] because Cs of an uncorrected lens is always positive.
+
+    Args:
+        rng (np.random.Generator): random number generator, e.g. np.random.default_rng(seed).
+        ranges (dict): maximum size of each aberration [m], see ABERRATION_RANGES.
+
+    Returns:
+        np.ndarray: length-10 aberration vector (see make_aberration_vector()).
+    """
+    def random_complex(max_size):
+        """Random complex number with real and imaginary parts uniform in [-max_size, max_size]."""
+        return complex(rng.uniform(-max_size, max_size), rng.uniform(-max_size, max_size))
+
+    return make_aberration_vector(C1=rng.uniform(-ranges["C1"], ranges["C1"]),
+                                  A1=random_complex(ranges["A1"]),
+                                  B2=random_complex(ranges["B2"]),
+                                  A2=random_complex(ranges["A2"]),
+                                  C3=rng.uniform(0, ranges["C3"]),
+                                  A3=random_complex(ranges["A3"]))
+
+
+def save_psf_dataset(n_samples=N_SAMPLES, folder=DATA_FOLDER, image_size=None, seed=None, **psf_settings):
+    """
+    Generate random PSFs with generate_psf() and save them as a CNN training set.
+
+    Output (in `folder`):
+        psf_00000.png, psf_00001.png, ...  16-bit greyscale PSF images (peak = 65535), the CNN inputs.
+        labels.csv          one row per image: filename + its 10-number aberration vector [m], the CNN targets.
+        dataset_info.json   the simulation settings used, so the dataset can be reproduced.
+    Existing files with the same names are overwritten.
+
+    Args:
+        n_samples (int):      number of PSFs to generate.
+        folder (str or Path): output folder (created if it doesn't exist).
+        image_size (int):     if given, keep only the central image_size x image_size pixels of each PSF.
+                              None keeps the full n x n PSF.
+        seed (int):           random seed for a reproducible dataset. None gives a different dataset every run.
+        **psf_settings:       settings passed on to generate_psf() (n, zpf, voltage, theta, d50geo).
+                              Anything not given uses the defaults from the Constants section.
+    """
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    n_filled = 0                    # samples stored so far
-    n_drawn = 0                     # samples drawn so far (including the redrawn ones)
-    t_start = time.perf_counter()
 
-    while n_filled < n_samples:
-        # Step 1: random coefficients and machine settings for one batch
-        batch_coeffs = sample_uniform(rng, COEFF_RANGES, COEFF_NAMES, BATCH_SIZE)
-        batch_machine = sample_uniform(rng, MACHINE_RANGES, machine_names, BATCH_SIZE)
+    # Fill in default settings for anything not given
+    settings = dict(n=N_PIXELS, zpf=ZERO_PAD, voltage=VOLTAGE, theta=HALF_ANGLE, d50geo=D50_GEO)
+    settings.update(psf_settings)
 
-        # Step 2: through-focus PSF stacks
-        batch_images, batch_contained = psf_stack(batch_coeffs, voltage=batch_machine[:, 0],
-                                                  theta=batch_machine[:, 1], d50_geo=batch_machine[:, 2])
-        n_drawn += BATCH_SIZE
+    with open(folder / "labels.csv", "w") as labels_file:
+        labels_file.write("filename," + ",".join(LABEL_NAMES) + "\n")
 
-        # Step 3: keep only the samples that fit in the window (worst plane counts)
-        keep = np.flatnonzero(batch_contained.min(axis=1) >= MIN_CONTAINED)
-        keep = keep[:n_samples - n_filled]                      # don't overshoot on the last batch
+        for i in range(n_samples):
+            # Random aberrations -> PSF
+            aber = random_aberration_vector(rng)
+            psf, _, pixel_size = generate_psf(aber, **settings)
 
-        # Step 4: store them
-        stored = slice(n_filled, n_filled + len(keep))
-        peak = batch_images[keep].max(axis=(-2, -1))
-        images[stored] = (batch_images[keep] / peak[:, :, None, None]).astype(np.float16)
-        scales[stored] = peak
-        coeffs[stored] = batch_coeffs[keep]
-        machine[stored] = batch_machine[keep]
-        contained[stored] = batch_contained[keep]
-        n_filled += len(keep)
+            # Optionally crop the central region (the PSF peak stays in the middle)
+            if image_size is not None:
+                start = settings["n"] // 2 - image_size // 2
+                psf = psf[start:start + image_size, start:start + image_size]
 
-        elapsed = time.perf_counter() - t_start
-        time_left = elapsed / n_filled * (n_samples - n_filled) if n_filled else 0
-        print(f'\r  {n_filled}/{n_samples} samples  ({elapsed:.0f} s, ~{time_left:.0f} s left, '
-              f'{100 * (1 - n_filled / n_drawn):.1f}% redrawn)', end='', flush=True)
-    print()
+            # Save the image as 16-bit PNG (0..1 -> 0..65535) and its vector as a row of labels.csv
+            filename = f"psf_{i:05d}.png"
+            Image.fromarray(np.round(psf * 65535).astype(np.uint16)).save(folder / filename)
+            labels_file.write(filename + "," + ",".join(f"{value:.6e}" for value in aber) + "\n")
 
-    images.flush()
-    np.save(os.path.join(folder, 'scales.npy'), scales)
-    np.save(os.path.join(folder, 'coeffs.npy'), coeffs)
-    np.save(os.path.join(folder, 'machine.npy'), machine)
-    np.save(os.path.join(folder, 'contained.npy'), contained)
+            if (i + 1) % max(1, n_samples // 10) == 0:
+                print(f"saved {i + 1}/{n_samples} PSFs")
 
-    redraw_fraction = 1 - n_samples / n_drawn
-    meta = {
-        'n_samples': n_samples,
-        'coeff_names': COEFF_NAMES,
-        'coeff_units': 'm',
-        'coeff_ranges': COEFF_RANGES,
-        'machine_names': machine_names,
-        'machine_units': ['V', 'rad', 'm'],
-        'machine_ranges': MACHINE_RANGES,
-        'nominal_machine': {'voltage': VOLTAGE, 'theta': THETA, 'd50_geo': D50_GEO},
-        'defocus_offsets_m': DEFOCUS_OFFSETS,
-        'pixel_size_m': PIXEL_SIZE,
-        'n_pixels': N_PIXELS,
-        'bin_factor': BIN_FACTOR,
-        'pad_factor': PAD_FACTOR,
-        'min_contained': MIN_CONTAINED,
-        'seed': seed,
-        'redraw_fraction': redraw_fraction,
-    }
-    with open(os.path.join(folder, 'meta.json'), 'w') as f:
-        json.dump(meta, f, indent=2)
-    return redraw_fraction
+    # Record how the dataset was made
+    info = dict(n_samples=n_samples, seed=seed, image_size=image_size, pixel_size_m=pixel_size,
+                psf_settings=settings, label_names=LABEL_NAMES, aberration_ranges_m=ABERRATION_RANGES)
+    with open(folder / "dataset_info.json", "w") as info_file:
+        json.dump(info, info_file, indent=4)
 
-def load_dataset(folder):
-    """
-    Load a generated dataset. The images are memory-mapped: they stay on disk and are only read
-    when used, so a 1 GB dataset can be opened instantly.
+    print(f"Dataset saved to {folder}")
 
-    folder : dataset folder, e.g. Data/psf_v1
-
-    Returns a dict with the arrays 'images', 'scales', 'coeffs', 'machine', 'contained' and the
-    settings dict 'meta' (see the Info section).
-    """
-    dataset = {'images': np.load(os.path.join(folder, 'images.npy'), mmap_mode='r')}
-    for name in ('scales', 'coeffs', 'machine', 'contained'):
-        dataset[name] = np.load(os.path.join(folder, f'{name}.npy'))
-    with open(os.path.join(folder, 'meta.json')) as f:
-        dataset['meta'] = json.load(f)
-    return dataset
-
-def half_ranges(meta):
-    """
-    Half the width of every coefficient's range. Dividing the coefficients by this puts them
-    roughly between -1 and 1, which is the scale the CNN learns on.
-
-    meta : the 'meta' dict of a dataset
-
-    Returns array (10,) in m.
-    """
-    ranges = meta['coeff_ranges']
-    return np.array([(ranges[name][1] - ranges[name][0]) / 2 for name in meta['coeff_names']])
-
-#################################################################################################################################################################
-"""Main"""
+#########################################################################################################
+""""Run this file"""
 
 def main():
-    """
-    Generate a dataset with the settings in constants.py.
-    """
-    p = argparse.ArgumentParser(description='Generate a through-focus PSF dataset for the CNN')
-    p.add_argument('--n', type=int, default=N_SAMPLES, help=f'number of samples (default {N_SAMPLES})')
-    p.add_argument('--name', type=str, default=DATASET_NAME, help=f'folder name in Data/ (default {DATASET_NAME})')
-    p.add_argument('--seed', type=int, default=SEED, help=f'random seed (default {SEED})')
-    args = p.parse_args()
+    """This functions runs everything from this file"""
+    # 1. Preview a single PSF, using the same example aberrations as WavePSF0.py
+    aber = make_aberration_vector(C1=0.5e-6,    # defocus [m]
+                                  A1=0,         # 2-fold astigmatism [m] (typ. 1e-8)
+                                  B2=0,         # coma [m] (typ. 1e-6)
+                                  A2=10e-6j,    # 3-fold astigmatism [m] (typ. 1e-6)
+                                  C3=0,         # spherical aberration [m] (typ. 1e-3)
+                                  A3=0)         # 4-fold astigmatism [m] (typ. 1e-4)
 
-    folder = os.path.join(DATA_FOLDER, args.name)
-    print(f'Generating {args.n} samples -> {folder}')
-    redraw_fraction = generate_dataset(folder, args.n, args.seed)
-    print(f'Done. {100 * redraw_fraction:.1f}% of the drawn samples did not fit in the window and were redrawn.')
+    psf, otf, pixel_size = generate_psf(aber)
+    print(f"PSF: pixel size = {pixel_size * 1e9:.3f} nm")
 
-if __name__ == '__main__':
-    main()
+    plot_psf(psf, pixel_size)   # close the plot window to continue
+
+    # 2. Generate the CNN training set in Data/PSF_data
+    save_psf_dataset(N_SAMPLES, seed=0)
+
+if __name__ == "__main__":
+    main() # makes sure this only runs if you run *this* file, not if this file is imported somewhere else
