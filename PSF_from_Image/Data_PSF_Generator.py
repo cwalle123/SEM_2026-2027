@@ -1,318 +1,271 @@
 # External imports
-import json
-from pathlib import Path
+import warnings
 import numpy as np
 import matplotlib.pyplot as plt
-from PIL import Image   # Pillow (installed with matplotlib), used to save 16-bit PNG images
+from scipy.signal import fftconvolve
+from matplotlib.colors import LogNorm
+import csv
+from pathlib import Path
 
 # Internal imports
 
-#########################################################################################################
+##################################################################################################################################################################################################################
 """Constants"""
 
-# Default simulation settings (used by main(), can be overridden in generate_psf())
-N_PIXELS   = 1024    # PSF grid size: N_PIXELS x N_PIXELS
-ZERO_PAD   = 5       # zero-padding factor (>= 1, sensible up to ~15). Larger = finer PSF pixels
-HALF_ANGLE = 0.015   # beam half opening angle (convergence semi-angle) [rad]
-VOLTAGE    = 30000   # accelerating voltage [V]
-D50_GEO    = 1e-9    # geometric probe size (source image): diameter containing 50% of the current [m]
+# Example abberation coefficients for testing the PSF generation
+c1  = 0.5e-6                #defocus [meter]        (e-6)
+a1r = 0;      a1i = 0;      #astigmatism            (e-8)
+b2r = 0;      b2i = 0;      #coma                   (e-6)
+a2r = 0;      a2i = 10e-6;  #3-fold astigmatism     (e-6)
+a3r = 0;      a3i = 0;      #4-fold astigmatism     (e-4)
+c3  = 0                     #spherical abberation   (e-3)
+example_abberation_vector = np.array([c1, a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i])   # order: C3 comes before A3
 
-# Relativistic electron wavelength: lambda = 1.226e-9 / sqrt(U * (1 + 9.785e-7 * U)), with U in volts
-WAVELENGTH_CONST  = 1.226e-9   # [m * V^0.5]
-RELATIVISTIC_CORR = 9.785e-7   # [1/V]
+electron_charge = 1.602176634e-19       # [C]
+V = 30000                               # Voltage [V]
+h = 6.62607015e-34                      # Planck's constant [J*s]
+c = 299792458                           # Speed of light [m/s]
+electron_mass = 9.10938356e-31          # Electron mass [kg]
+electron_wavelength = h / np.sqrt(2 * electron_mass * electron_charge * V + (1 / c**2 ) * (electron_charge * V)**2)  # Relativistic electron wavelength [m] for an accelerating voltage [V]
 
-# Training data settings
-N_SAMPLES   = 1000                                                   # number of PSFs to generate
-DATA_FOLDER = Path(__file__).resolve().parent / "Data" / "PSF_data"  # output folder, next to this file
-LABEL_NAMES = ["C1", "A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3", "A3r", "A3i"]  # order of the aberration vector
-
-# Maximum size of each aberration when drawing random training data [m]
-# (based on the typical values noted in WavePSF0.py, adjust to match your microscope)
-ABERRATION_RANGES = {"C1": 0.5e-6,   # defocus
-                     "A1": 1e-8,     # 2-fold astigmatism
-                     "B2": 1e-6,     # axial coma
-                     "A2": 10e-6,    # 3-fold astigmatism
-                     "C3": 1e-3,     # spherical aberration
-                     "A3": 1e-4}     # 4-fold astigmatism
-
-#########################################################################################################
+##################################################################################################################################################################################################################
 """Functions"""
 
-def electron_wavelength(voltage):
-    """
-    Compute the relativistic wavelength of an electron.
+# ---- Functions to generate EXAMPLE surfaces and PSFs, and to convolve them. THESE ARE ONLY USED FOR CHECKING THAT THE PSF IS WORKING -----"
+def make_sample_surface(n=201, extent=10):
+    """Sinusoidal 2D surface with fine detail, so blurring by the PSF is visible."""
+    x = np.linspace(-extent, extent, n)
+    y = np.linspace(-extent, extent, n)
+    X, Y = np.meshgrid(x, y)
+    S = (0.3 * np.sin(0.5 * X) + 0.2 * np.cos(0.4 * Y) + 0.1 * np.sin(0.3 * (X + Y)) + 0.1 * np.sin(4 * X) * np.cos(4 * Y))
+    return X, Y, S
 
-    Args:
-        voltage (float): accelerating voltage [V].
+def plot_example_surface(x, y, surface):
+    """This function plots the example surface"""
+    fig = plt.figure(figsize=(9, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(x, y, surface, cmap="viridis", linewidth=0, antialiased=True)
+    ax.set_zlim(-3, 3)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    plt.show()
 
-    Returns:
-        float: electron wavelength [m].
-    """
-    corrected_voltage = voltage * (1 + RELATIVISTIC_CORR * voltage)
-    return WAVELENGTH_CONST / np.sqrt(corrected_voltage)
+# plot_example_surface(*make_sample_surface())
 
+def psf_grid(size):
+    """Centered integer grid, size must be odd."""
+    r = np.arange(size) - size // 2
+    return np.meshgrid(r, r)
 
-def make_aberration_vector(C1=0.0, A1=0j, B2=0j, A2=0j, C3=0.0, A3=0j):
-    """
-    Pack the 6 aberration coefficients into a single numpy vector.
+def make_astigmatic_psf(size=31, sigma_x=5, sigma_y=3):
+    """2D astigmatic Gaussian PSF, normalized to sum 1."""
+    X, Y = psf_grid(size)
+    g = np.exp(-(X**2 / (2 * sigma_x**2) + Y**2 / (2 * sigma_y**2)))
+    return g / g.sum()
 
-    Non-round aberrations have a size and a direction, so they are given as complex numbers
-    (real part = x component, imaginary part = y component), e.g. A1 = 5e-9 + 2e-9j.
+def convolve(f, g):
+    """h = f * g, output same shape as f."""
+    return fftconvolve(f, g, mode="same")
 
-    Args:
-        C1 (float):   defocus [m].
-        A1 (complex): two-fold astigmatism [m].
-        B2 (complex): axial coma [m].
-        A2 (complex): three-fold astigmatism [m].
-        C3 (float):   spherical aberration, Cs [m].
-        A3 (complex): four-fold astigmatism [m].
+def plot_convolution():
+    """This function plots the convolution of f and g."""
+    f = make_sample_surface()[2]
+    g = make_astigmatic_psf(size=31, sigma_x=5, sigma_y=3)     # size >= 6*max(sigma)+1, otherwise the Gaussian tails get cut off
+    h = convolve(f, g)
 
-    Returns:
-        np.ndarray: length-10 float vector
-                    [C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i]
-                    (same ordering as the `aber` array in WavePSF0.py).
-    """
-    A1, B2, A2, A3 = complex(A1), complex(B2), complex(A2), complex(A3)
-    return np.array([C1,
-                     A1.real, A1.imag,
-                     B2.real, B2.imag,
-                     A2.real, A2.imag,
-                     C3,
-                     A3.real, A3.imag])
+    fig = plt.figure(figsize=(14, 6))
 
+    ax1 = fig.add_subplot(1, 3, 1, projection="3d")
+    ax1.plot_surface(*np.meshgrid(np.arange(f.shape[0]), np.arange(f.shape[1])), f, cmap="viridis", linewidth=0, antialiased=True)
+    ax1.set_title("f (input surface)")
 
-def aberration_function(ax, ay, theta, aber):
-    """
-    Compute the wave aberration W (the optical path difference) at each beam angle.
+    ax2 = fig.add_subplot(1, 3, 2, projection="3d")
+    ax2.plot_surface(*np.meshgrid(np.arange(g.shape[0]), np.arange(g.shape[1])), g, cmap="viridis", linewidth=0, antialiased=True)
+    ax2.set_title("g (PSF)")
 
-    The coma and spherical terms are balanced against lower orders in the same way as
-    Zernike polynomials (see Born & Wolf, Principles of Optics), exactly as in WavePSF0.py.
+    ax3 = fig.add_subplot(1, 3, 3, projection="3d")
+    ax3.plot_surface(*np.meshgrid(np.arange(h.shape[0]), np.arange(h.shape[1])), h, cmap="viridis", linewidth=0, antialiased=True)
+    ax3.set_title("h = f * g (convolution)")
 
-    Args:
-        ax (np.ndarray): beam angle in x [rad].
-        ay (np.ndarray): beam angle in y [rad].
-        theta (float):   half opening angle, i.e. the angle at the aperture edge [rad].
-        aber (np.ndarray): aberration vector from make_aberration_vector().
-
-    Returns:
-        np.ndarray: wave aberration W(ax, ay) [m], same shape as ax.
-    """
-    C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i = aber
-    r2  = ax**2 + ay**2   # squared angle from the optical axis
-    th2 = theta**2
-
-    W  = 0.5 * C1 * r2                                                        # defocus
-    W += 0.5 * A1r * (ax**2 - ay**2) + A1i * ax * ay                          # 2-fold astigmatism
-    W += (B2r * ax - B2i * ay) * (r2 - (2/3) * th2)                           # axial coma
-    W += A2r * ax * (ax**2 / 3 - ay**2) + A2i * ay * (ax**2 - ay**2 / 3)      # 3-fold astigmatism
-    W += 0.25 * C3 * r2 * (r2 - th2)                                          # spherical aberration
-    W += A3r * (ax**4 + ay**4 - 6 * ax**2 * ay**2) + A3i * 4 * ax * ay * (ax**2 - ay**2)  # 4-fold astigmatism
-    return W
-
-
-def generate_psf(aber, n=N_PIXELS, zpf=ZERO_PAD, voltage=VOLTAGE, theta=HALF_ANGLE, d50geo=D50_GEO):
-    """
-    Simulate the wave-optical probe PSF of an SEM (chromatic aberration not included).
-
-    Steps:
-        1. Build the pupil (aperture) function: a disc with phase exp(i * k * W).
-        2. Fourier transform it to get the probe wavefunction; its intensity is the PSF.
-        3. Blur with a Gaussian to account for the finite source size (d50geo).
-
-    Args:
-        aber (np.ndarray): aberration vector from make_aberration_vector().
-        n (int):           PSF grid size (n x n pixels).
-        zpf (float):       zero-padding factor (>= 1). Sets the PSF pixel size.
-        voltage (float):   accelerating voltage [V].
-        theta (float):     half opening angle [rad].
-        d50geo (float):    geometric probe size (50% diameter) [m]. Use 0 for no source blur.
-
-    Returns:
-        psf (np.ndarray):   n x n PSF, centred in the array, normalised to a peak of 1.
-        otf (np.ndarray):   n x n complex OTF, zero frequency at [0, 0], normalised so otf[0, 0] = 1.
-        pixel_size (float): size of one PSF pixel [m].
-    """
-    assert zpf >= 1, "zero pad factor must be >= 1"
-
-    # Basic optics quantities
-    wavelength = electron_wavelength(voltage)
-    k = 2 * np.pi / wavelength                    # wave number [1/m]
-    pixel_size = wavelength / (2 * zpf * theta)   # PSF pixel size [m]
-
-    # Pupil-plane grid: the aperture is a disc of radius n/(2*zpf) pixels in the middle of the grid,
-    # the rest is zeros ("zero padding"), which is what sets the PSF pixel size above
-    centre = n // 2
-    aperture_radius_px = n / (2 * zpf)
-    angle_per_px = theta / aperture_radius_px     # beam angle covered by one pupil pixel [rad]
-    rows, cols = np.indices((n, n))
-    x_px = cols - centre
-    y_px = rows - centre
-    inside_aperture = x_px**2 + y_px**2 <= aperture_radius_px**2
-
-    # Pupil function: unit amplitude inside the aperture, phase = k * W
-    W = aberration_function(x_px * angle_per_px, y_px * angle_per_px, theta, aber)
-    pupil = np.where(inside_aperture, np.exp(1j * k * W), 0)
-
-    # Probe wavefunction = Fourier transform of the pupil, PSF = its intensity
-    psf = np.abs(np.fft.fft2(pupil))**2
-    psf /= psf.sum()
-    otf = np.fft.fft2(psf)
-
-    # Finite source size: convolving the PSF with a Gaussian = multiplying the OTF by a Gaussian
-    if d50geo > 0:
-        # A 2D Gaussian with standard deviation sigma has 50% of its intensity within d50 = sigma * sqrt(8 ln 2)
-        sigma_px = d50geo / (pixel_size * np.sqrt(8 * np.log(2)))
-        f = np.fft.fftfreq(n)                     # spatial frequencies [cycles/pixel], zero at index 0
-        f2 = f[:, None]**2 + f[None, :]**2
-        otf *= np.exp(-2 * np.pi**2 * sigma_px**2 * f2)
-        psf = np.abs(np.fft.ifft2(otf))
-
-    # Move the PSF peak from [0, 0] to the centre of the array and normalise to a peak of 1
-    psf = np.fft.fftshift(psf) / psf.max()
-    return psf, otf, pixel_size
-
-
-def plot_psf(psf, pixel_size, fov_nm=None, title="Simulated PSF"):
-    """
-    Show a PSF as an image together with its horizontal and vertical cross-sections.
-
-    Args:
-        psf (np.ndarray):   centred PSF from generate_psf().
-        pixel_size (float): PSF pixel size [m].
-        fov_nm (float):     width of the region to show [nm]. None shows the full PSF.
-        title (str):        figure title.
-    """
-    n = psf.shape[0]
-    centre = n // 2
-    coords_nm = (np.arange(n) - centre) * pixel_size * 1e9   # pixel positions [nm], 0 at the centre
-    half_width = coords_nm[-1] if fov_nm is None else fov_nm / 2
-
-    fig, (ax_img, ax_cut) = plt.subplots(1, 2, figsize=(11, 5))
-    fig.suptitle(title)
-
-    # PSF image
-    extent = [coords_nm[0], coords_nm[-1], coords_nm[-1], coords_nm[0]]
-    im = ax_img.imshow(psf, cmap="gray", extent=extent)
-    ax_img.set_xlim(-half_width, half_width)
-    ax_img.set_ylim(half_width, -half_width)
-    ax_img.set_xlabel("x [nm]")
-    ax_img.set_ylabel("y [nm]")
-    fig.colorbar(im, ax=ax_img, fraction=0.046)
-
-    # Cross-sections through the centre
-    ax_cut.plot(coords_nm, psf[centre, :], "b-", label="x (horizontal)")
-    ax_cut.plot(coords_nm, psf[:, centre], "r-", label="y (vertical)")
-    ax_cut.set_xlim(-half_width, half_width)
-    ax_cut.set_xlabel("position [nm]")
-    ax_cut.set_ylabel("intensity (peak = 1)")
-    ax_cut.legend()
+    for ax in (ax1, ax2, ax3):
+        ax.set_zlim(-3, 3)
+        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
 
     plt.tight_layout()
     plt.show()
 
+# plot_convolution()
 
-def random_aberration_vector(rng, ranges=ABERRATION_RANGES):
-    """
-    Draw a random aberration vector containing all 6 aberrations.
+# ----- Functions to generate PSFs from abberation coefficients. These will be used later in a loop to generate a dataset of PSFs -----
 
-    Each component is drawn uniformly from [-max, +max], except spherical aberration (C3),
-    which is drawn from [0, max] because Cs of an uncorrected lens is always positive.
+def abberation_function(tx, ty, alpha, aberration_vector):
+    """phi(x', y') [m]: Zernike-balanced wave aberration over a circular aperture.
+    tx, ty = ray angles [rad], alpha = half opening angle [rad].
+    aberration_vector = [C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i] in meters."""
+    C1  = aberration_vector[0]
+    A1r = aberration_vector[1];    A1i = aberration_vector[2]
+    B2r = aberration_vector[3];    B2i = aberration_vector[4]
+    A2r = aberration_vector[5];    A2i = aberration_vector[6]
+    C3  = aberration_vector[7]
+    A3r = aberration_vector[8];    A3i = aberration_vector[9]
 
-    Args:
-        rng (np.random.Generator): random number generator, e.g. np.random.default_rng(seed).
-        ranges (dict): maximum size of each aberration [m], see ABERRATION_RANGES.
+    tx2 = tx**2;   ty2 = ty**2;   al2 = alpha**2
+    S  = 0.5*C1*(tx2 + ty2) + 0.5*A1r*(tx2 - ty2) + A1i*tx*ty                    # defocus, 2-fold astigmatism:  Re{1/2 w w* C1 + 1/2 w*^2 A1}
+    S += (B2r*tx - B2i*ty)*(tx2 + ty2 - (2/3)*al2)                               # coma (tilt-balanced):          Re{w^2 w* B2}
+    S += A2r*tx*((tx2/3) - ty2) + A2i*ty*(tx2 - (ty2/3))                         # 3-fold astigmatism:            Re{1/3 w*^3 A2}
+    S += 0.25*C3*(tx2 + ty2)*(tx2 + ty2 - al2)                                   # spherical (defocus-balanced):  Re{1/4 (w w*)^2 C3}
+    S += 0.25*(A3r*(tx**4 + ty**4 - 6*tx2*ty2) + A3i*(4*tx*ty*(tx2 - ty2)))      # 4-fold astigmatism:            Re{1/4 w*^4 A3}, same 1/n prefactor pattern as A1 and A2
+    return S
 
-    Returns:
-        np.ndarray: length-10 aberration vector (see make_aberration_vector()).
-    """
-    def random_complex(max_size):
-        """Random complex number with real and imaginary parts uniform in [-max_size, max_size]."""
-        return complex(rng.uniform(-max_size, max_size), rng.uniform(-max_size, max_size))
+def pupil_function(n, pixel_size, wavelength, alpha, aber):
+    """P(x', y') = A(x', y') * exp(j 2pi/lambda * phi(x', y'))   (Eq. 3 and 4)."""
+    dtheta = wavelength / (n * pixel_size)      # angular step, chosen so that the FFT lands on image pixels of size pixel_size
+    if n * dtheta / 2 < alpha:
+        raise ValueError(f"Aperture doesn't fit: need pixel_size < {wavelength / (2 * alpha):.3e} m")
+    theta = (np.arange(n) - n // 2) * dtheta
+    TX, TY = np.meshgrid(theta, theta)
+    A = (np.hypot(TX, TY) <= alpha).astype(float)
+    phi = abberation_function(TX, TY, alpha, aber)
+    P = A * np.exp(1j * 2 * np.pi / wavelength * phi)
 
-    return make_aberration_vector(C1=rng.uniform(-ranges["C1"], ranges["C1"]),
-                                  A1=random_complex(ranges["A1"]),
-                                  B2=random_complex(ranges["B2"]),
-                                  A2=random_complex(ranges["A2"]),
-                                  C3=rng.uniform(0, ranges["C3"]),
-                                  A3=random_complex(ranges["A3"]))
+    phase = 2 * np.pi / wavelength * phi
+    gy, gx = np.gradient(phase)
+    max_step = np.max(np.hypot(gx, gy)[A > 0])
+    if max_step > np.pi:
+        warnings.warn(f"Pupil phase undersampled ({max_step:.1f} rad/px > pi): increase n")
+    return theta, A, phase, P
 
+def make_aberration_psf(aber, voltage=V, alpha=20e-3, pixel_size=20e-12, n=2048):
+    """Aberration coefficients [m] -> intensity PSF Psi(x, y), normalized to sum 1."""
+    def electron_wavelength(V):
+        return h / np.sqrt(2 * electron_mass * electron_charge * V + (1 / c**2 ) * (electron_charge * V)**2)
+    
+    wavelength = electron_wavelength(voltage)
+    theta, A, phase, P = pupil_function(n, pixel_size, wavelength, alpha, aber)
 
-def save_psf_dataset(n_samples=N_SAMPLES, folder=DATA_FOLDER, image_size=None, seed=None, **psf_settings):
-    """
-    Generate random PSFs with generate_psf() and save them as a CNN training set.
+    # Eq. 5: the complex PSF U(x, y) is the Fourier transform of the pupil function P(x', y')
+    U = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(P)))
+    # Intensity PSF Psi(x, y) = |U(x, y)|^2, normalized to sum 1 (replaces the 1/(pi theta^2) prefactor) so it can be used as a convolution kernel
+    psi = np.abs(U)**2
+    psi /= psi.sum()
 
-    Output (in `folder`):
-        psf_00000.png, psf_00001.png, ...  16-bit greyscale PSF images (peak = 65535), the CNN inputs.
-        labels.csv          one row per image: filename + its 10-number aberration vector [m], the CNN targets.
-        dataset_info.json   the simulation settings used, so the dataset can be reproduced.
-    Existing files with the same names are overwritten.
+    x = (np.arange(n) - n // 2) * pixel_size
+    phase_masked = np.where(A > 0, phase, np.nan)
+    return theta, x, phase_masked, psi
 
-    Args:
-        n_samples (int):      number of PSFs to generate.
-        folder (str or Path): output folder (created if it doesn't exist).
-        image_size (int):     if given, keep only the central image_size x image_size pixels of each PSF.
-                              None keeps the full n x n PSF.
-        seed (int):           random seed for a reproducible dataset. None gives a different dataset every run.
-        **psf_settings:       settings passed on to generate_psf() (n, zpf, voltage, theta, d50geo).
-                              Anything not given uses the defaults from the Constants section.
-    """
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
+def plot_psf(theta, x, phase, psi, alpha, crop=600):
+    """This function plots the pupil phase and the PSF intensity (linear and log scale).
+    crop = half width of the PSF window around the center [px]."""
+    c = len(x) // 2
+    s = slice(c - crop, c + crop)                                   # PSF window around the center
+    a = np.abs(theta) <= 1.1 * alpha                                # only the angles around the aperture
+    x_nm = x[s] * 1e9
+    th_mrad = theta[a] * 1e3
+    psf_extent = [x_nm[0], x_nm[-1], x_nm[0], x_nm[-1]]
+    pupil_extent = [th_mrad[0], th_mrad[-1], th_mrad[0], th_mrad[-1]]
+
+    wrapped_phase = np.angle(np.exp(1j * phase[np.ix_(a, a)]))      # wrap to [-pi, pi], NaN outside the aperture stays NaN
+    psi_crop = psi[s, s]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5.2))
+
+    im1 = ax1.imshow(wrapped_phase, origin="lower", extent=pupil_extent, cmap="twilight", vmin=-np.pi, vmax=np.pi)
+    ax1.add_patch(plt.Circle((0, 0), alpha * 1e3, fill=False, color="k", lw=1))
+    ax1.set_title("Pupil phase  2π/λ·φ(x', y')")
+    ax1.set_xlabel("θx [mrad]"); ax1.set_ylabel("θy [mrad]")
+    cb1 = fig.colorbar(im1, ax=ax1, shrink=0.85, label="Phase [rad]")
+    cb1.set_ticks([-np.pi, 0, np.pi]); cb1.set_ticklabels(["−π", "0", "π"])
+
+    im2 = ax2.imshow(psi_crop, origin="lower", extent=psf_extent, cmap="inferno")
+    ax2.set_title("PSF intensity Ψ(x, y)")
+    ax2.set_xlabel("x [nm]"); ax2.set_ylabel("y [nm]")
+    fig.colorbar(im2, ax=ax2, shrink=0.85, label="Ψ (normalized)")
+
+    im3 = ax3.imshow(psi_crop, origin="lower", extent=psf_extent, cmap="inferno",
+                     norm=LogNorm(vmin=psi_crop.max() * 1e-4, vmax=psi_crop.max()))
+    ax3.set_title("PSF intensity Ψ(x, y), log scale")
+    ax3.set_xlabel("x [nm]"); ax3.set_ylabel("y [nm]")
+    fig.colorbar(im3, ax=ax3, shrink=0.85, label="Ψ (normalized)")
+
+    for ax in (ax1, ax2, ax3):
+        ax.set_aspect("equal")
+
+    plt.tight_layout()
+    plt.show()
+
+# alpha = 20e-3
+# theta, x, phase, psi = make_aberration_psf(example_abberation_vector, voltage=V, alpha=alpha, pixel_size=20e-12, n=2048)
+# plot_psf(theta, x, phase, psi, alpha, crop=600)
+
+# ----- Functions to generate a TRAINING dataset of PSFs with their abberation vectors -----
+
+aberration_labels = ["C1", "A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3", "A3r", "A3i"]
+aberration_ranges = np.array([0.5e-6,                   # C1        max |value| per coefficient [m], vectors are sampled uniformly in [-range, range]
+                              1e-8,   1e-8,             # A1r, A1i
+                              1e-6,   1e-6,             # B2r, B2i
+                              10e-6,  10e-6,            # A2r, A2i
+                              1e-3,                     # C3
+                              1e-4,   1e-4])            # A3r, A3i
+
+def random_aberration_vectors(n_samples, ranges=aberration_ranges, seed=None):
+    """Random aberration vectors, each coefficient uniform in [-range, range]. Shape (n_samples, 10)."""
     rng = np.random.default_rng(seed)
+    return rng.uniform(-1, 1, size=(n_samples, len(ranges))) * ranges
 
-    # Fill in default settings for anything not given
-    settings = dict(n=N_PIXELS, zpf=ZERO_PAD, voltage=VOLTAGE, theta=HALF_ANGLE, d50geo=D50_GEO)
-    settings.update(psf_settings)
+def bin_image(image, out_size):
+    """Downsamples a square image to (out_size, out_size) by summing blocks of pixels (keeps the total intensity)."""
+    factor = image.shape[0] // out_size
+    return image[:out_size * factor, :out_size * factor].reshape(out_size, factor, out_size, factor).sum(axis=(1, 3))
 
-    with open(folder / "labels.csv", "w") as labels_file:
-        labels_file.write("filename," + ",".join(LABEL_NAMES) + "\n")
+def generate_training_dataset(n_samples, out_size=128, crop=640, voltage=V, alpha=20e-3, pixel_size=20e-12, n=2048,
+                              ranges=aberration_ranges, val_fraction=0.1, test_fraction=0.1, seed=0,
+                              filename="psf_dataset.npz", folder="Data", n_preview=10):
+    """Generates n_samples PSFs from random aberration vectors and saves everything in one file in the Data folder:
+      images              (N, out_size, out_size) float32  -> PSF images, binned from the (2*crop)^2 center of the full PSF
+      labels              (N, 10) float32                  -> aberration vectors scaled to [-1, 1] (= aberration_vectors / ranges), what the network predicts
+      aberration_vectors  (N, 10)                          -> the real coefficients [m]
+      ranges, label_names                                  -> to convert predicted labels back to meters: labels * ranges
+      train_idx, val_idx, test_idx                         -> fixed split, so every training run uses the same test set
+      voltage, alpha, pixel_size, binned_pixel_size        -> microscope settings the images were made with
+    The first n_preview images are also saved as PNG for a quick look."""
+    folder = Path(__file__).parent / folder
+    folder.mkdir(exist_ok=True)
+    if (2 * crop) % out_size != 0 or crop > n // 2:
+        raise ValueError("2*crop must be divisible by out_size and crop must be <= n // 2")
+    s = slice(n // 2 - crop, n // 2 + crop)
 
-        for i in range(n_samples):
-            # Random aberrations -> PSF
-            aber = random_aberration_vector(rng)
-            psf, _, pixel_size = generate_psf(aber, **settings)
+    aberration_vectors = random_aberration_vectors(n_samples, ranges, seed)
+    images = np.empty((n_samples, out_size, out_size), dtype=np.float32)
 
-            # Optionally crop the central region (the PSF peak stays in the middle)
-            if image_size is not None:
-                start = settings["n"] // 2 - image_size // 2
-                psf = psf[start:start + image_size, start:start + image_size]
+    for i, aber in enumerate(aberration_vectors):
+        psi = make_aberration_psf(aber, voltage=voltage, alpha=alpha, pixel_size=pixel_size, n=n)[3][s, s]
+        images[i] = bin_image(psi, out_size)
+        if i < n_preview:
+            plt.imsave(folder / f"preview_{i:05d}.png", images[i], cmap="inferno", origin="lower")
+        if (i + 1) % 100 == 0 or i + 1 == n_samples:
+            print(f"Generated {i + 1}/{n_samples} PSFs")
 
-            # Save the image as 16-bit PNG (0..1 -> 0..65535) and its vector as a row of labels.csv
-            filename = f"psf_{i:05d}.png"
-            Image.fromarray(np.round(psf * 65535).astype(np.uint16)).save(folder / filename)
-            labels_file.write(filename + "," + ",".join(f"{value:.6e}" for value in aber) + "\n")
+    labels = (aberration_vectors / ranges).astype(np.float32)          # all coefficients on the same [-1, 1] scale, otherwise C3 (e-3) dominates the loss over A1 (e-8)
 
-            if (i + 1) % max(1, n_samples // 10) == 0:
-                print(f"saved {i + 1}/{n_samples} PSFs")
+    idx = np.random.default_rng(seed + 1).permutation(n_samples)
+    n_test = int(test_fraction * n_samples)
+    n_val = int(val_fraction * n_samples)
+    test_idx, val_idx, train_idx = idx[:n_test], idx[n_test:n_test + n_val], idx[n_test + n_val:]
 
-    # Record how the dataset was made
-    info = dict(n_samples=n_samples, seed=seed, image_size=image_size, pixel_size_m=pixel_size,
-                psf_settings=settings, label_names=LABEL_NAMES, aberration_ranges_m=ABERRATION_RANGES)
-    with open(folder / "dataset_info.json", "w") as info_file:
-        json.dump(info, info_file, indent=4)
-
-    print(f"Dataset saved to {folder}")
+    np.savez_compressed(folder / filename, images=images, labels=labels, aberration_vectors=aberration_vectors,
+                        ranges=ranges, label_names=np.array(aberration_labels),
+                        train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
+                        voltage=voltage, alpha=alpha, pixel_size=pixel_size,
+                        binned_pixel_size=pixel_size * (2 * crop // out_size))
+    print(f"Saved {n_samples} samples to {folder / filename}")
 
 #########################################################################################################
 """"Run this file"""
 
 def main():
     """This functions runs everything from this file"""
-    # 1. Preview a single PSF, using the same example aberrations as WavePSF0.py
-    aber = make_aberration_vector(C1=0.5e-6,    # defocus [m]
-                                  A1=0,         # 2-fold astigmatism [m] (typ. 1e-8)
-                                  B2=0,         # coma [m] (typ. 1e-6)
-                                  A2=10e-6j,    # 3-fold astigmatism [m] (typ. 1e-6)
-                                  C3=0,         # spherical aberration [m] (typ. 1e-3)
-                                  A3=0)         # 4-fold astigmatism [m] (typ. 1e-4)
+    # plot_example_surface(example_sample_surface)
 
-    psf, otf, pixel_size = generate_psf(aber)
-    print(f"PSF: pixel size = {pixel_size * 1e9:.3f} nm")
-
-    plot_psf(psf, pixel_size)   # close the plot window to continue
-
-    # 2. Generate the CNN training set in Data/PSF_data
-    save_psf_dataset(N_SAMPLES, seed=0)
+    # generate_training_dataset(n_samples=50) # generates 50 PSFs and saves them in Data/psf_dataset.npz, also saves the first 10 as PNG for a quick look
 
 if __name__ == "__main__":
     main() # makes sure this only runs if you run *this* file, not if this file is imported somewhere else
