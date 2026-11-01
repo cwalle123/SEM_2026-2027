@@ -6,7 +6,6 @@ from scipy.signal import fftconvolve
 from matplotlib.colors import LogNorm
 import csv
 from pathlib import Path
-
 # Internal imports
 
 ##################################################################################################################################################################################################################
@@ -219,6 +218,7 @@ def bin_image(image, out_size):
 def generate_training_dataset(n_samples, out_size=128, crop=640, voltage=V, alpha=20e-3, pixel_size=20e-12, n=2048,
                               ranges=aberration_ranges, val_fraction=0.1, test_fraction=0.1, seed=0,
                               filename="psf_dataset.npz", folder="Data", n_preview=10):
+    
     """Generates n_samples PSFs from random aberration vectors and saves everything in one file in the Data folder:
       images              (N, out_size, out_size) float32  -> PSF images, binned from the (2*crop)^2 center of the full PSF
       labels              (N, 10) float32                  -> aberration vectors scaled to [-1, 1] (= aberration_vectors / ranges), what the network predicts
@@ -226,7 +226,10 @@ def generate_training_dataset(n_samples, out_size=128, crop=640, voltage=V, alph
       ranges, label_names                                  -> to convert predicted labels back to meters: labels * ranges
       train_idx, val_idx, test_idx                         -> fixed split, so every training run uses the same test set
       voltage, alpha, pixel_size, binned_pixel_size        -> microscope settings the images were made with
-    The first n_preview images are also saved as PNG for a quick look."""
+    The first n_preview images are also saved as PNG for a quick look.
+    """
+
+
     folder = Path(__file__).parent / folder
     folder.mkdir(exist_ok=True)
     if (2 * crop) % out_size != 0 or crop > n // 2:
@@ -265,7 +268,7 @@ def main():
     """This functions runs everything from this file"""
     # plot_example_surface(example_sample_surface)
 
-    # generate_training_dataset(n_samples=50) # generates 50 PSFs and saves them in Data/psf_dataset.npz, also saves the first 10 as PNG for a quick look
+    #generate_training_dataset(n_samples=1000) # generates 50 PSFs and saves them in Data/psf_dataset.npz, also saves the first 10 as PNG for a quick look
 
 if __name__ == "__main__":
     main() # makes sure this only runs if you run *this* file, not if this file is imported somewhere else
