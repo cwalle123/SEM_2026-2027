@@ -1,8 +1,11 @@
 # External imports
 import json
+import os
 import time
+import multiprocessing as mp
 import warnings
 import numpy as np
+import scipy.fft
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -58,27 +61,56 @@ def aberration_function(tx, ty, alpha, aberration_vector):
     S += 0.25*(A3r*(tx**4 + ty**4 - 6*tx2*ty2) + A3i*(4*tx*ty*(tx2 - ty2)))      # 4-fold astigmatism:            Re{1/4 w*^4 A3}
     return S
 
-def make_psf(aberration_vector, voltage, alpha, pixel_size, n):
-    """Aberration vector [m] -> intensity PSF Psi(x, y) of shape (n, n), normalized to sum 1."""
-    wavelength = electron_wavelength(voltage)
-    dtheta = wavelength / (n * pixel_size)              # angular step, chosen so that the FFT lands on image pixels of size pixel_size
-    if n * dtheta / 2 < alpha:
-        raise ValueError(f"Aperture doesn't fit: need pixel_size < {wavelength / (2 * alpha):.3e} m")
+class PSFGenerator:
+    """Makes intensity PSFs for one fixed microscope setting (voltage, alpha, pixel_size, n, crop).
+    Everything that is the same for every PSF is computed once here, so each call only does the work that changes:
+      - the aberration polynomial is split into 10 fixed basis maps (one per coefficient), so the phase is one matrix product
+      - the phase is only evaluated in the small square around the aperture, not on the whole n x n grid
+      - phase, pupil and FFT are single precision (float32 / complex64), plenty for a PSF that is binned afterwards
+      - only the crop window is turned into intensity; the normalization comes from Parseval, not from summing the full PSF."""
 
-    theta = (np.arange(n) - n // 2) * dtheta
-    TX, TY = np.meshgrid(theta, theta)
-    A = (np.hypot(TX, TY) <= alpha).astype(float)
-    phase = 2 * np.pi / wavelength * aberration_function(TX, TY, alpha, aberration_vector)
+    def __init__(self, voltage, alpha, pixel_size, n, crop, fft_workers=-1):
+        wavelength = electron_wavelength(voltage)
+        dtheta = wavelength / (n * pixel_size)          # angular step, chosen so that the FFT lands on image pixels of size pixel_size
+        if n * dtheta / 2 < alpha:
+            raise ValueError(f"Aperture doesn't fit: need pixel_size < {wavelength / (2 * alpha):.3e} m")
 
-    gy, gx = np.gradient(phase)
-    max_step = np.max(np.hypot(gx, gy)[A > 0])
-    if max_step > np.pi:
-        warnings.warn(f"Pupil phase undersampled ({max_step:.1f} rad/px > pi): increase n * pixel_size")
+        # Square window around the aperture inside the full n x n pupil grid
+        half = int(np.ceil(alpha / dtheta)) + 1
+        self.box = slice(n // 2 - half, n // 2 + half + 1)
+        theta = (np.arange(-half, half + 1)) * dtheta
+        TX, TY = np.meshgrid(theta, theta)
+        self.box_shape = TX.shape
+        self.aperture = np.hypot(TX, TY) <= alpha
+        self.aperture_f32 = self.aperture.astype(np.float32)
 
-    P = A * np.exp(1j * phase)                                          # pupil function P(x', y')
-    U = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(P)))               # complex PSF U(x, y) = FT{P}
-    psi = np.abs(U)**2                                                  # intensity PSF
-    return psi / psi.sum()
+        # Basis map k = phase [rad] for a coefficient vector with 1 m in position k and 0 elsewhere (the polynomial is linear in the coefficients)
+        basis = np.stack([2 * np.pi / wavelength * aberration_function(TX, TY, alpha, np.eye(10)[k]) for k in range(10)], axis=-1)
+        self.basis = basis.reshape(-1, 10).astype(np.float32)
+
+        self.n = n
+        self.fft_workers = fft_workers
+        self.crop = slice(n // 2 - crop, n // 2 + crop)
+        self.pupil = np.zeros((n, n), dtype=np.complex64)               # reused buffer, zero outside the aperture
+        self.norm = n**2 * self.aperture.sum()                          # Parseval: sum |FT{P}|^2 = n^2 * sum |P|^2
+
+    def __call__(self, aberration_vector):
+        """Aberration vector [m] -> intensity PSF in the crop window (2*crop x 2*crop), normalized so the full PSF sums to 1."""
+        phase = (self.basis @ np.asarray(aberration_vector, dtype=np.float32)).reshape(self.box_shape)
+
+        # Sampling check on a 4x coarser grid (the phase is a smooth polynomial, so its gradient changes slowly): 16x cheaper
+        k = 4
+        gy, gx = np.gradient(phase[::k, ::k])
+        max_step = np.max(np.hypot(gx, gy)[self.aperture[::k, ::k]]) / k
+        if max_step > np.pi:
+            warnings.warn(f"Pupil phase undersampled ({max_step:.1f} rad/px > pi): increase n * pixel_size")
+
+        box = self.pupil[self.box, self.box]                                     # view into the pupil buffer
+        box.real = np.cos(phase) * self.aperture_f32                             # pupil function P(x', y') = A exp(j phase)
+        box.imag = np.sin(phase) * self.aperture_f32
+        U = scipy.fft.fftshift(scipy.fft.fft2(scipy.fft.ifftshift(self.pupil), workers=self.fft_workers))   # complex PSF U(x, y) = FT{P}
+        U_crop = U[self.crop, self.crop]
+        return (U_crop.real**2 + U_crop.imag**2).astype(np.float64) / self.norm                  # intensity PSF in the crop window
 
 def bin_image(image, out_size):
     """Downsamples a square image to (out_size, out_size) by summing blocks of pixels (keeps the total intensity)."""
@@ -98,6 +130,19 @@ def make_aberration_sets(n_samples, defocus=defocus_values, bounds=aberration_bo
     sets[:, :, 1:] = shared[:, None, :]         # same other coefficients for all vectors in the set
     return shared, sets
 
+_worker_generator = None
+
+def _init_worker(voltage, alpha, pixel_size, n, crop):
+    """Runs once in every worker process: builds that worker's own PSFGenerator (1 FFT thread each, the processes give the parallelism)."""
+    global _worker_generator
+    _worker_generator = PSFGenerator(voltage, alpha, pixel_size, n, crop, fft_workers=1)
+
+def _make_set(args):
+    """Worker task: all PSFs of one aberration set -> (index, binned images, fraction of energy in the crop per channel)."""
+    i, aberration_set, out_size = args
+    psis = [_worker_generator(vector) for vector in aberration_set]
+    return i, np.stack([bin_image(p, out_size) for p in psis]).astype(np.float32), [p.sum() for p in psis]
+
 def format_time(seconds):
     """Seconds -> 'h:mm:ss'."""
     seconds = int(round(seconds))
@@ -105,7 +150,7 @@ def format_time(seconds):
 
 def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072,
                               defocus=defocus_values, bounds=aberration_bounds, val_fraction=0.1, test_fraction=0.1, seed=0,
-                              filename="psf_dataset.npz", folder="Data", n_preview=10, checkpoint_every=10):
+                              filename="psf_dataset.npz", folder="Data", n_preview=10, checkpoint_every=10, n_workers=None):
     """Generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file:
       images              (N, 3, out_size, out_size) float32  -> one PSF per vector in the set, binned from the (2*crop)^2 center
       aberration_vectors  (N, 3, 10)                          -> the full vectors [C1, A1r, ..., A3i] of each set [m]
@@ -117,12 +162,13 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
     The first n_preview stacks are also saved as PNG for a quick look.
     Progress is cached in the Data folder every checkpoint_every sets. If the run stops, just run it again with the same
     settings and it continues where it stopped. The cache files are deleted once the final .npz is saved.
+    n_workers = number of parallel processes (default: half the CPU threads). Each one uses roughly 0.5-1 GB of RAM,
+    so lower it if your computer runs out of memory.
     """
     folder = Path(__file__).parent / folder
     folder.mkdir(exist_ok=True)
     if (2 * crop) % out_size != 0 or crop > n // 2:
         raise ValueError("2*crop must be divisible by out_size and crop must be <= n // 2")
-    s = slice(n // 2 - crop, n // 2 + crop)
 
     shared, aberration_vectors = make_aberration_sets(n_samples, defocus, bounds, seed)   # deterministic from seed, so a resumed run gets the same vectors
 
@@ -152,26 +198,31 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
         tmp.write_text(json.dumps({"n_done": done, "settings": settings}))
         tmp.replace(cache_progress)                                        # atomic, so a crash while writing can't corrupt the progress file
 
-    start = time.perf_counter()
-    for i in range(n_done, n_samples):
-        aberration_set = aberration_vectors[i]
-        for j, vector in enumerate(aberration_set):
-            psi = make_psf(vector, voltage, alpha, pixel_size, n)
-            psi_crop = psi[s, s]
-            if psi_crop.sum() < 0.99:
-                warnings.warn(f"Sample {i}, channel {j}: {100 * (1 - psi_crop.sum()):.1f}% of the PSF falls outside the crop window, increase crop (and n)")
-            images[i, j] = bin_image(psi_crop, out_size)
-        if i < n_preview:
-            plt.imsave(folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in images[i]]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
+    if n_workers is None:
+        n_workers = max(1, (os.cpu_count() or 2) // 2)
+    print(f"Using {n_workers} worker process(es); setting up the PSF generator takes a few seconds per worker")
 
-        done = i + 1
-        if done % checkpoint_every == 0 or done == n_samples:
-            save_progress(done)
-        if done % 10 == 0 or done == n_samples:
-            elapsed = time.perf_counter() - start
-            remaining = elapsed / (done - n_done) * (n_samples - done)          # rate based on this run only, so resuming gives a correct estimate
-            print(f"\rGenerated {done}/{n_samples} PSF sets ({100 * done / n_samples:.1f}%) | "
-                  f"elapsed {format_time(elapsed)} | remaining ~{format_time(remaining)}", end="", flush=True)
+    tasks = ((i, aberration_vectors[i], out_size) for i in range(n_done, n_samples))
+    start = None
+    with mp.Pool(n_workers, initializer=_init_worker, initargs=(voltage, alpha, pixel_size, n, crop)) as pool:
+        for i, stack, energy in pool.imap(_make_set, tasks):              # imap keeps the order, so the cache always holds sets 0..done-1
+            if start is None:
+                start, first = time.perf_counter(), i                     # time from the first finished set, so the setup doesn't skew the estimate
+            for j, e in enumerate(energy):
+                if e < 0.99:
+                    warnings.warn(f"Sample {i}, channel {j}: {100 * (1 - e):.1f}% of the PSF falls outside the crop window, increase crop (and n)")
+            images[i] = stack
+            if i < n_preview:
+                plt.imsave(folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in stack]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
+
+            done = i + 1
+            if done % checkpoint_every == 0 or done == n_samples:
+                save_progress(done)
+            if done % 10 == 0 or done == n_samples:
+                elapsed = time.perf_counter() - start
+                rate = elapsed / max(done - first - 1, 1)                 # seconds per set in this run
+                print(f"\rGenerated {done}/{n_samples} PSF sets ({100 * done / n_samples:.1f}%) | "
+                      f"elapsed {format_time(elapsed)} | remaining ~{format_time(rate * (n_samples - done))}", end="", flush=True)
     print()
 
     low, high = bounds[:, 0], bounds[:, 1]

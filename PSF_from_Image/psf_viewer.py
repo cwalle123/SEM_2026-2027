@@ -2,10 +2,7 @@
 import warnings
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import fftconvolve
 from matplotlib.colors import LogNorm
-import csv
-from pathlib import Path
 # Internal imports
 
 ##################################################################################################################################################################################################################
@@ -28,9 +25,7 @@ electron_mass = 9.10938356e-31          # Electron mass [kg]
 electron_wavelength = h / np.sqrt(2 * electron_mass * electron_charge * V + (1 / c**2 ) * (electron_charge * V)**2)  # Relativistic electron wavelength [m] for an accelerating voltage [V]
 
 ##################################################################################################################################################################################################################
-"""Functions"""
-
-# ----- Functions to generate PSFs from abberation coefficients. These will be used later in a loop to generate a dataset of PSFs -----
+"""Functions to generate PSFs from abberation coefficients """
 
 def abberation_function(tx, ty, alpha, aberration_vector):
     """phi(x', y') [m]: Zernike-balanced wave aberration over a circular aperture.
