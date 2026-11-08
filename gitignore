@@ -1,7 +1,0 @@
-# Generated PSF datasets (large, can be regenerated with generate_psf_dataset.py)
-*.npz
-
-# Cache files from an unfinished run
-*_partial_images.npy
-*_partial_progress.json
-*_partial_progress.tmp
