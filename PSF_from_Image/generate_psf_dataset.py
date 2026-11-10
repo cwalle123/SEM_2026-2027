@@ -32,10 +32,10 @@ aberration_labels = vector_labels[1:]
 #                                low      high
 aberration_bounds = np.array([[-500e-9,  500e-9],       # A1r   2-fold astigmatism: residual after manual stigmation, tens to hundreds of nm
                               [-500e-9,  500e-9],       # A1i
-                              [  -5e-6,    5e-6],       # B2r   axial coma: from beam misalignment, ~um
-                              [  -5e-6,    5e-6],       # B2i
-                              [ -20e-6,   20e-6],       # A2r   3-fold astigmatism: parasitic, ~um to tens of um
-                              [ -20e-6,   20e-6],       # A2i
+                              [  -50e-6,    50e-6],       # B2r   axial coma: from beam misalignment, ~um
+                              [  -50e-6,    50e-6],       # B2i
+                              [ -50e-6,   50e-6],       # A2r   3-fold astigmatism: parasitic, ~um to tens of um
+                              [ -50e-6,   50e-6],       # A2i
                               [ 0.5e-3,    2e-3],       # C3    spherical: 0.5-2 mm for uncorrected objective lenses, always > 0 for round lenses (Scherzer)
                               [-200e-6,  200e-6],       # A3r   4-fold astigmatism: parasitic, tens to hundreds of um
                               [-200e-6,  200e-6]])      # A3i

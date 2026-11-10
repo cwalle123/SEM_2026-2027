@@ -9,7 +9,9 @@ PSF_from_Image/Data/preview_00006.png
 PSF_from_Image/Data/preview_00007.png
 PSF_from_Image/Data/preview_00008.png
 PSF_from_Image/Data/preview_00009.png
-
+PSF_from_Image/Data
+ConvolutionalNeural_Net_Iter.2/Trained_Models
+ConvolutionalNeural_Net_Iter.1/Trained_Models
 *_partial_images.npy
 *_partial_progress.json
 *_partial_progress.tmp

@@ -9,10 +9,10 @@ from matplotlib.colors import LogNorm
 """Constants"""
 
 # Example abberation coefficients for testing the PSF generation
-c1  = 0.5e-6                # defocus [meter]        (e-6)
+c1  = 0e-6                # defocus [meter]        (e-6)
 a1r = 0;      a1i = 0;      # astigmatism            (e-8)
 b2r = 0;      b2i = 0;      # coma                   (e-6)
-a2r = 0;      a2i = 10e-6;  # 3-fold astigmatism     (e-6)
+a2r = 40e-6;      a2i = 10e-6;  # 3-fold astigmatism     (e-6)
 a3r = 0;      a3i = 0;      # 4-fold astigmatism     (e-4)
 c3  = 0                     # spherical abberation   (e-3)
 example_abberation_vector = np.array([c1, a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i])   # order: C3 comes before A3
