@@ -29,16 +29,45 @@ aberration_labels = vector_labels[1:]
 # Each coefficient is sampled uniformly in [low, high] [m]. Values for an uncorrected SEM objective lens (30 kV, alpha = 20 mrad).
 # For reference, the pi/4 tolerances at 30 kV / 20 mrad are roughly: A1 ~4 nm, B2 and A2 ~0.3 um, C3 and A3 ~20 um,
 # so all ranges below are clearly visible in the PSF.
+# Sources:
+#   [1] Uno, Honda, Nakamura, Matsuya & Zach, "Aberration correction and its automatic control in scanning electron microscopes",
+#       Optik 116 (2005) 438-448. Through-focus SEM aberration retrieval for C1, A1, B2, A2, Cs; typical orders of magnitude
+#       A1 ~1e-8, B2 ~1e-7, A2 ~1e-6, Cs ~1e-3 m (as tabulated by Dortland, TU Delft BEP "A benchmark study on SEM aberration retrieval", 2024,
+#       who measured A1 ~93 nm, B2 ~0.1 um, A2 ~2 um, Cs ~1 mm on a real SEM and tested B2 up to 8 um, A2 up to 20 um, Cs up to 5 mm).
+#   [2] Kazumori et al., Microsc. Microanal. 6 (S2) (2000) 764: JSM-6700F conical objective, Cs = 1.9 mm at WD = 3 mm.
+#       JEOL SEM glossary: out-lens objective at WD ~10 mm has Cs ~50 mm (only usable with alpha ~5 mrad, not 20 mrad).
+#       Cs scales roughly with WD^3 (Microscopy Today, "Some things you might like to know about electron lenses").
+#   [3] Rudnaya, "Automated focusing and astigmatism correction in electron microscopy", PhD thesis TU/e (2011):
+#       defocus and two-fold astigmatism drift and must be re-corrected regularly, so A1 can be large before stigmation.
+#   [4] Krivanek, Dellby & Lupini, "Towards sub-A electron beams", Ultramicroscopy 78 (1999) 1: without correction,
+#       aberrations other than C1 and C3 are usually much smaller and are left out; A3 is a third-order parasitic of the objective.
+# Crop budget: the crop is +-172.8 nm and the 5 um defocus alone already spreads the beam over +-100 nm (C1 * alpha),
+# so the summed worst-case ray deviations of all other ranges are kept below ~60 nm (checked numerically: >99% energy in the crop).
 #                                low      high
-aberration_bounds = np.array([[-500e-9,  500e-9],       # A1r   2-fold astigmatism: residual after manual stigmation, tens to hundreds of nm
-                              [-500e-9,  500e-9],       # A1i
-                              [  -50e-6,    50e-6],       # B2r   axial coma: from beam misalignment, ~um
-                              [  -50e-6,    50e-6],       # B2i
-                              [ -50e-6,   50e-6],       # A2r   3-fold astigmatism: parasitic, ~um to tens of um
-                              [ -50e-6,   50e-6],       # A2i
-                              [ 0.5e-3,    2e-3],       # C3    spherical: 0.5-2 mm for uncorrected objective lenses, always > 0 for round lenses (Scherzer)
-                              [-200e-6,  200e-6],       # A3r   4-fold astigmatism: parasitic, tens to hundreds of um
+aberration_bounds = np.array([[  -1e-6,    1e-6],       # A1r   2-fold astigmatism: ~10-100 nm after stigmation [1], up to ~um before/with drift [3]
+                              [  -1e-6,    1e-6],       # A1i
+                              [ -10e-6,   10e-6],       # B2r   axial coma: ~0.1 um when aligned [1]; misalignment tilt tau gives B2 ~ Cs*tau ~ 2 mm * 5 mrad = 10 um
+                              [ -10e-6,   10e-6],       # B2i
+                              [ -20e-6,   20e-6],       # A2r   3-fold astigmatism: ~1-2 um measured [1]; 20 um = upper end tested in [1]-based benchmark
+                              [ -20e-6,   20e-6],       # A2i
+                              [ 0.5e-3,    5e-3],       # C3    spherical: 0.5 mm (well-designed pole piece) to 5 mm (longer WD) [2]; always > 0 (Scherzer)
+                              [-200e-6,  200e-6],       # A3r   4-fold astigmatism: parasitic, rarely measured on SEMs [4]; ~10x the pi/4 tolerance
                               [-200e-6,  200e-6]])      # A3i
+
+# Which coefficients are random in each dataset type. Inactive coefficients are set to exactly 0.
+#   3: A1 + C3      -> defocus, 2-fold astigmatism and spherical aberration: the classic uncorrected-SEM probe model; C3 is
+#                      unavoidable for round lenses and A1 is the aberration the operator corrects every session [3], [4]
+#   7: + B2 + A2    -> exactly the 5 aberrations (C1, A1, B2, A2, Cs) measured from SEM through-focus series by Uno et al. [1]:
+#                      all axial aberrations up to second order plus the third-order Cs
+#   9: + A3         -> everything up to third order in this model
+coefficient_sets = {3: ["A1r", "A1i", "C3"],
+                    7: ["A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3"],
+                    9: aberration_labels}
+
+def dataset_name(n_coefficients, n_samples):
+    """Clear filename, e.g. 'psf_3coef_A1-C3_n1000.npz' or 'psf_7coef_A1-B2-A2-C3_n1000.npz'."""
+    groups = list(dict.fromkeys(label.rstrip("ri") for label in coefficient_sets[n_coefficients]))   # A1r, A1i -> A1 (C3 stays C3)
+    return f"psf_{n_coefficients}coef_{'-'.join(groups)}_n{n_samples}.npz"
 
 ##################################################################################################################################################################################################################
 """PSF generation"""
@@ -120,11 +149,14 @@ def bin_image(image, out_size):
 ##################################################################################################################################################################################################################
 """Dataset generation"""
 
-def make_aberration_sets(n_samples, defocus=defocus_values, bounds=aberration_bounds, seed=0):
+def make_aberration_sets(n_samples, active=aberration_labels, defocus=defocus_values, bounds=aberration_bounds, seed=0):
     """Random aberration sets. Each set = len(defocus) full vectors with the SAME random coefficients, only C1 differs.
+    Only the coefficients in `active` are random; all others are exactly 0.
     Returns shared (n_samples, 9) and sets (n_samples, len(defocus), 10)."""
     rng = np.random.default_rng(seed)
-    shared = rng.uniform(bounds[:, 0], bounds[:, 1], size=(n_samples, len(bounds)))
+    mask = np.isin(aberration_labels, active)
+    shared = np.zeros((n_samples, len(bounds)))
+    shared[:, mask] = rng.uniform(bounds[mask, 0], bounds[mask, 1], size=(n_samples, mask.sum()))
     sets = np.empty((n_samples, len(defocus), len(bounds) + 1))
     sets[:, :, 0] = defocus                     # C1 per vector in the set
     sets[:, :, 1:] = shared[:, None, :]         # same other coefficients for all vectors in the set
@@ -148,18 +180,22 @@ def format_time(seconds):
     seconds = int(round(seconds))
     return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
-def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072,
+def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072,
                               defocus=defocus_values, bounds=aberration_bounds, val_fraction=0.1, test_fraction=0.1, seed=0,
-                              filename="psf_dataset.npz", folder="Data", n_preview=10, checkpoint_every=10, n_workers=None):
-    """Generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file:
+                              filename=None, folder="Data", n_preview=3, checkpoint_every=10, n_workers=None):
+    """Generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file.
+    n_coefficients = 3, 7 or 9: which coefficients are random (see coefficient_sets); all others are exactly 0.
+    filename = None gives a clear automatic name, e.g. psf_3coef_A1-C3_n1000.npz. The file contains:
       images              (N, 3, out_size, out_size) float32  -> one PSF per vector in the set, binned from the (2*crop)^2 center
-      aberration_vectors  (N, 3, 10)                          -> the full vectors [C1, A1r, ..., A3i] of each set [m]
-      labels              (N, 9) float32                      -> the shared coefficients (no C1) scaled to [-1, 1] within their bounds, what the network predicts
+      aberration_vectors  (N, 3, 10)                          -> the full vectors [C1, A1r, ..., A3i] of each set [m] (inactive ones = 0)
+      labels              (N, K) float32                      -> the K active coefficients scaled to [-1, 1] within their bounds, what the network predicts
       defocus_values      (3,)                                -> C1 of each channel [m]
-      bounds, label_names                                     -> to convert predicted labels back to meters: low + (labels + 1) / 2 * (high - low)
+      bounds, label_names                                     -> (K, 2) and (K,) for the active coefficients, to convert labels back to meters:
+                                                                 low + (labels + 1) / 2 * (high - low)
+      n_coefficients, active_mask                             -> which of the 9 coefficients were random (mask over [A1r, ..., A3i])
       train_idx, val_idx, test_idx                            -> fixed split, so every training run uses the same test set
       voltage, alpha, pixel_size, binned_pixel_size           -> microscope settings the images were made with
-    The first n_preview stacks are also saved as PNG for a quick look.
+    The first n_preview stacks are also saved as PNG for a quick look (in Data/<dataset name>_previews/).
     Progress is cached in the Data folder every checkpoint_every sets. If the run stops, just run it again with the same
     settings and it continues where it stopped. The cache files are deleted once the final .npz is saved.
     n_workers = number of parallel processes (default: half the CPU threads). Each one uses roughly 0.5-1 GB of RAM,
@@ -170,14 +206,25 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
     if (2 * crop) % out_size != 0 or crop > n // 2:
         raise ValueError("2*crop must be divisible by out_size and crop must be <= n // 2")
 
-    shared, aberration_vectors = make_aberration_sets(n_samples, defocus, bounds, seed)   # deterministic from seed, so a resumed run gets the same vectors
+    if n_coefficients not in coefficient_sets:
+        raise ValueError(f"n_coefficients must be one of {list(coefficient_sets)}")
+    active = coefficient_sets[n_coefficients]
+    active_mask = np.isin(aberration_labels, active)
+    if filename is None:
+        filename = dataset_name(n_coefficients, n_samples)
+    print(f"Dataset {filename}: random coefficients {active}, all others 0")
+
+    shared, aberration_vectors = make_aberration_sets(n_samples, active, defocus, bounds, seed)   # deterministic from seed, so a resumed run gets the same vectors
 
     # ----- Cache: images are written straight to a .npy file on disk, progress is saved every checkpoint_every sets -----
     stem = Path(filename).stem
     cache_images = folder / f"{stem}_partial_images.npy"
     cache_progress = folder / f"{stem}_partial_progress.json"
-    settings = dict(n_samples=n_samples, out_size=out_size, crop=crop, voltage=voltage, alpha=alpha, pixel_size=pixel_size,
-                    n=n, defocus=np.asarray(defocus).tolist(), bounds=np.asarray(bounds).tolist(), seed=seed)
+    preview_folder = folder / f"{stem}_previews"
+    if n_preview > 0:
+        preview_folder.mkdir(exist_ok=True)
+    settings = dict(n_samples=n_samples, n_coefficients=n_coefficients, out_size=out_size, crop=crop, voltage=voltage, alpha=alpha,
+                    pixel_size=pixel_size, n=n, defocus=np.asarray(defocus).tolist(), bounds=np.asarray(bounds).tolist(), seed=seed)
     shape = (n_samples, len(defocus), out_size, out_size)
 
     n_done = 0
@@ -213,7 +260,7 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
                     warnings.warn(f"Sample {i}, channel {j}: {100 * (1 - e):.1f}% of the PSF falls outside the crop window, increase crop (and n)")
             images[i] = stack
             if i < n_preview:
-                plt.imsave(folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in stack]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
+                plt.imsave(preview_folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in stack]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
 
             done = i + 1
             if done % checkpoint_every == 0 or done == n_samples:
@@ -225,8 +272,10 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
                       f"elapsed {format_time(elapsed)} | remaining ~{format_time(rate * (n_samples - done))}", end="", flush=True)
     print()
 
-    low, high = bounds[:, 0], bounds[:, 1]
-    labels = (2 * (shared - low) / (high - low) - 1).astype(np.float32)     # all coefficients on the same [-1, 1] scale, otherwise C3 (e-3) dominates the loss over A1 (e-7)
+    active_bounds = bounds[active_mask]
+    low, high = active_bounds[:, 0], active_bounds[:, 1]
+    labels = (2 * (shared[:, active_mask] - low) / (high - low) - 1).astype(np.float32)   # only the active coefficients, all on the same [-1, 1] scale,
+                                                                                            # otherwise C3 (e-3) dominates the loss over A1 (e-7)
 
     idx = np.random.default_rng(seed + 1).permutation(n_samples)
     n_test = int(test_fraction * n_samples)
@@ -234,7 +283,8 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
     test_idx, val_idx, train_idx = idx[:n_test], idx[n_test:n_test + n_val], idx[n_test + n_val:]
 
     np.savez_compressed(folder / filename, images=np.asarray(images), labels=labels, aberration_vectors=aberration_vectors,
-                        defocus_values=np.asarray(defocus), bounds=bounds, label_names=np.array(aberration_labels), vector_labels=np.array(vector_labels),
+                        defocus_values=np.asarray(defocus), bounds=active_bounds, label_names=np.array(active), vector_labels=np.array(vector_labels),
+                        n_coefficients=n_coefficients, active_mask=active_mask,
                         train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
                         voltage=voltage, alpha=alpha, pixel_size=pixel_size,
                         binned_pixel_size=pixel_size * (2 * crop // out_size))
@@ -247,7 +297,9 @@ def generate_training_dataset(n_samples, out_size=128, crop=1152, voltage=V, alp
 """Run this file"""
 
 def main():
-    generate_training_dataset(n_samples=1000)
+    # n_coefficients = 3 (A1, C3), 7 (A1, B2, A2, C3) or 9 (all). Every type gets its own file, cache and preview folder,
+    # e.g. Data/psf_3coef_A1-C3_n1000.npz, Data/psf_7coef_A1-B2-A2-C3_n1000.npz, Data/psf_9coef_A1-B2-A2-C3-A3_n1000.npz
+    generate_training_dataset(n_samples=1000, n_coefficients=9)
 
 if __name__ == "__main__":
     main()

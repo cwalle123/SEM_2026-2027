@@ -8,7 +8,7 @@ Simulates wave-optical point spread functions (PSFs) of an SEM electron probe fr
 |---------------------------|----------------------------------------------------------------------------------------------------------|
 | `WavePSF0.py`             | The old PSF script from Noah, kept as the reference for the wave-optical PSF calculation                 |
 | `psf_viewer.py`           | Computes a single PSF from one aberration vector and plots the PSF intensity to see what it looks like.  |
-| `generate_psf_dataset.py` | Makes training data: random aberration vectors with 3 set C1 + their images → `Data/psf_dataset.npz`.    |
+| `generate_psf_dataset.py` | Makes training data: random aberration vectors with 3 set C1 + their images → `Data/psf_<k>coef_….npz`.  |
 | `Data/`                   | Output folder for the dataset and the preview images.                                                    |
 
 ## How the PSF is calculated
@@ -59,21 +59,45 @@ This plots the PSF for `example_abberation_vector` at the top of the file (by de
 python generate_psf_dataset.py
 ```
 
-By default this generates 1000 samples. Change `n_samples` in `main()` for more or fewer.
+By default this generates 1000 samples of the 3-coefficient dataset. In `main()`, change `n_samples` for more or fewer samples and `n_coefficients` (3, 7 or 9) for the dataset type.
+
+### Dataset types
+
+`n_coefficients` sets how many coefficients are random. Every coefficient that is not in the chosen set is exactly 0. C1 is not counted: it is always used, fixed per channel (see below). So the vectors have 4, 8 or 10 coefficients in use, but they are always stored as the full 10-number vector with zeros in the unused slots.
+
+| `n_coefficients` | Random coefficients                   | Filename (for `n_samples = 1000`)  | Why this set                                                                                                               |
+|------------------|---------------------------------------|------------------------------------|----------------------------------------------------------------------------------------------------------------------------|
+| 3                | A1r, A1i, C3                          | `psf_3coef_A1-C3_n1000.npz`        | Classic uncorrected-SEM probe: C3 is unavoidable for round lenses, A1 is corrected by the operator every session [3], [4]  |
+| 7                | A1r, A1i, B2r, B2i, A2r, A2i, C3      | `psf_7coef_A1-B2-A2-C3_n1000.npz`  | Exactly the aberrations (with C1) retrieved from SEM through-focus series by Uno et al. [1]: everything up to second order plus Cs |
+| 9                | All: A1r … A3i                        | `psf_9coef_A1-B2-A2-C3-A3_n1000.npz` | Everything up to third order in this model                                                                               |
+
+Each type gets its own file, cache and preview folder, so the types don't overwrite each other. You can also pass your own `filename`.
 
 ### What one sample is
 
-Each sample is an **aberration set**: one random draw of the 9 coefficients A1r … A3i, imaged at three fixed defocus values, **C1 = +5 µm, 0, −5 µm**. This gives a 3-channel image (one channel per defocus). The network has to predict the 9 shared coefficients. C1 is not a target because it is fixed per channel.
+Each sample is an **aberration set**: one random draw of the active coefficients, imaged at three fixed defocus values, **C1 = +5 µm, 0, −5 µm**. This gives a 3-channel image (one channel per defocus). The network has to predict the 3, 7 or 9 shared coefficients. C1 is not a target because it is fixed per channel.
 
 The coefficients are drawn uniformly from `aberration_bounds` at the top of the file. The defaults are chosen for an uncorrected SEM objective lens at 30 kV and α = 20 mrad:
 
-| Coefficient | Range                        |
-|-------------|------------------------------|
-| A1 (r, i)   | ±500 nm                      |
-| B2 (r, i)   | ±5 µm                        |
-| A2 (r, i)   | ±20 µm                       |
-| C3          | 0.5 – 2 mm (always positive) |
-| A3 (r, i)   | ±200 µm                      |
+| Coefficient | Range                        | Basis                                                                                                            |
+|-------------|------------------------------|------------------------------------------------------------------------------------------------------------------|
+| A1 (r, i)   | ±1 µm                        | ~10–100 nm after stigmation [1]; much larger before stigmation, since it drifts and must be re-corrected [3]     |
+| B2 (r, i)   | ±10 µm                       | ~0.1 µm when aligned [1]; beam misalignment gives B2 ≈ Cs · tilt ≈ 2 mm × 5 mrad ≈ 10 µm                          |
+| A2 (r, i)   | ±20 µm                       | ~1–2 µm measured on a real SEM; 20 µm is the upper end tested in [5]                                             |
+| C3          | 0.5 – 5 mm (always positive) | 1.9 mm for a conical objective at WD = 3 mm [2]; Cs grows roughly as WD³. Always > 0 for round lenses (Scherzer)  |
+| A3 (r, i)   | ±200 µm                      | Third-order parasitic, rarely measured on SEMs [4]; ~10× the π/4 tolerance                                       |
+
+Out-lens SEMs at WD ≈ 10 mm have Cs of tens of mm, but those are used with α ≈ 5 mrad, not 20 mrad, so they are not in the range.
+
+The 5 µm defocus alone already spreads the beam over ±100 nm of the ±173 nm crop window. The ranges were checked numerically: even with every coefficient at a worst-case extreme, more than 99.9% of each PSF stays inside the crop and the pupil phase is not undersampled.
+
+**References**
+
+1. S. Uno, K. Honda, N. Nakamura, M. Matsuya, J. Zach, "Aberration correction and its automatic control in scanning electron microscopes", *Optik* 116 (2005) 438–448.
+2. H. Kazumori et al., "Field Emission SEM with a Newly Developed FEGUN and Conical Strongly Excited Objective Lens", *Microsc. Microanal.* 6 (S2) (2000) 764–765.
+3. M. Rudnaya, *Automated focusing and astigmatism correction in electron microscopy*, PhD thesis, TU Eindhoven (2011).
+4. O. L. Krivanek, N. Dellby, A. R. Lupini, "Towards sub-Å electron beams", *Ultramicroscopy* 78 (1999) 1–11.
+5. R. Dortland, *A benchmark study on SEM aberration retrieval*, BSc thesis, TU Delft (2024).
 
 ### Default settings
 
@@ -93,32 +117,34 @@ The coefficients are drawn uniformly from `aberration_bounds` at the top of the 
 
 ### Resuming an interrupted run
 
-Progress is cached in `Data/` (`psf_dataset_partial_images.npy` and `psf_dataset_partial_progress.json`) every 10 sets. If a run stops, run the script again with the **same settings** and it continues where it left off. The cache files are deleted once the final `.npz` has been saved. If you change the settings, delete the cache files first or use a different `filename`.
+Progress is cached in `Data/` (`<dataset name>_partial_images.npy` and `<dataset name>_partial_progress.json`) every 10 sets. If a run stops, run the script again with the **same settings** and it continues where it left off. The cache files are deleted once the final `.npz` has been saved. If you change the settings, delete the cache files first or use a different `filename`.
 
 ### Output
 
-`Data/psf_dataset.npz` contains:
+Each dataset file (for example `Data/psf_3coef_A1-C3_n1000.npz`) contains, with K = 3, 7 or 9:
 
-| Key                                                   | Shape                    | Contents                                          |
-|-------------------------------------------------------|--------------------------|---------------------------------------------------|
-| `images`                                              | (N, 3, 128, 128) float32 | The CNN input: one binned PSF per defocus channel |
-| `labels`                                              | (N, 9) float32           | The CNN target: coefficients scaled to [−1, 1]    |
-| `aberration_vectors`                                  | (N, 3, 10)               | The full vectors for each channel [m]             |
-| `defocus_values`                                      | (3,)                     | C1 of each channel [m]                            |
-| `bounds`, `label_names`, `vector_labels`              |                          | Needed to convert labels back to metres           |
-| `train_idx`, `val_idx`, `test_idx`                    |                          | The fixed dataset split                           |
-| `voltage`, `alpha`, `pixel_size`, `binned_pixel_size` |                          | The microscope settings the images were made with |
+| Key                                                   | Shape                    | Contents                                                              |
+|-------------------------------------------------------|--------------------------|-----------------------------------------------------------------------|
+| `images`                                              | (N, 3, 128, 128) float32 | The CNN input: one binned PSF per defocus channel                     |
+| `labels`                                              | (N, K) float32           | The CNN target: the active coefficients scaled to [−1, 1]             |
+| `aberration_vectors`                                  | (N, 3, 10)               | The full vectors for each channel [m], unused coefficients are 0      |
+| `defocus_values`                                      | (3,)                     | C1 of each channel [m]                                                |
+| `bounds`, `label_names`                               | (K, 2), (K,)             | Bounds and names of the active coefficients, to convert labels back to metres |
+| `vector_labels`                                       | (10,)                    | Names of the 10 entries of the full vector                            |
+| `n_coefficients`, `active_mask`                       | scalar, (9,)             | Dataset type, and which of A1r … A3i were random                      |
+| `train_idx`, `val_idx`, `test_idx`                    |                          | The fixed dataset split                                               |
+| `voltage`, `alpha`, `pixel_size`, `binned_pixel_size` |                          | The microscope settings the images were made with                     |
 
 The labels are scaled to [−1, 1] because the raw coefficients differ by several orders of magnitude. Without scaling, C3 (~10⁻³ m) would dominate the loss over A1 (~10⁻⁷ m).
 
-`Data/preview_00000.png` … `preview_00009.png` show the first 10 samples, with the three defocus channels side by side. Each panel is scaled to its own maximum, so the previews are for a quick look only.
+`Data/<dataset name>_previews/preview_00000.png` … `preview_00002.png` show the first 3 samples, with the three defocus channels side by side. Each panel is scaled to its own maximum, so the previews are for a quick look only.
 
 ### Loading the dataset
 
 ```python
 import numpy as np
 
-data = np.load("Data/psf_dataset.npz")
+data = np.load("Data/psf_3coef_A1-C3_n1000.npz")
 X, y = data["images"], data["labels"]
 
 X_train, y_train = X[data["train_idx"]], y[data["train_idx"]]
