@@ -27,14 +27,15 @@ file_name="psf_9coef_A1-B2-A2-C3-A3_n1000.npz" #name of the dataset you want to 
 
 #Other
 n_datapoints_plotting = 100 #Number of datapoints used for plotting in total
-n_display=5#epochs between prints of losses display
-n_batch=500 #Determines batch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+n_display=10#epochs between prints of losses display
+n_batch=300 #Determines batch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
 n_lowpass=50 #Window used for early validation stop whether the general tendency is to increaso er decrease despite noise
+n_save=100 #Epochs per save made
+n_epochs=5000
 
 #Learning hyperparameters
 max_pool_1=2
 max_pool_2=2
-n_epochs=50000
 training_set_fraction=0.8
 validation_set_fraction=0.2
 learning_rate=0.001
@@ -119,17 +120,16 @@ if train:
 
     dataset_size=np.shape(images)[0]
     #print(np.shape(vectors))
-    print(np.shape(images))
+
     images=np.reshape(images,(dataset_size,n_in_channels,image_size,image_size)) #For it to not be confused with channel size (N,C,W,H) is used for pytorch
-    print(np.shape(images))
-    print(np.shape(vectors))
+
     #Will now split into validation and train (as all figures are randomly generated, then there is no issue with this splitting being biased)
 
     x_train=images[:int(dataset_size*training_set_fraction)]
-    x_validation=images[int(dataset_size*validation_set_fraction):]
+    x_validation=images[int(dataset_size*training_set_fraction):]
 
     y_train=vectors[:int(dataset_size*training_set_fraction)]
-    y_validation=vectors[int(dataset_size*validation_set_fraction):]
+    y_validation=vectors[int(dataset_size*training_set_fraction):]
 
     #And now convert to tensor
 
@@ -138,7 +138,6 @@ if train:
 
     y_train=torch.tensor(y_train).to(torch.float32)
     y_validation=torch.tensor(y_validation).to(torch.float32)
-
 
 ############
 #Training
@@ -155,33 +154,29 @@ if train:
 
         optimizer.zero_grad() #Makes sure all grads for lerning are set to zero
 
-        idx=np.random.uniform(0,len(x_train)-1,n_batch) #Generates the random indexes for the icrobatch generation, otheriwse memory kills my laptop
+        if n%n_save==0 and n>1: #TO save progress avoids issues when curing mid training
+            print(f"\nSaved model and other relevant data at epoch {n}")
+            np.savez_compressed(f"{Base_Directory}/ConvolutionalNeural_Net_Iter.2/Trained_Models/{model_name}/model_data.npz",loss_train_arr=loss_train_arr,loss_validation_arr=loss_validation_arr,ranges=ranges,images_std=images_std)
+            torch.save(model.state_dict(),f"{Base_Directory}/ConvolutionalNeural_Net_Iter.2/Trained_Models/{model_name}/{model_name}.pth")
 
+
+        idx=np.random.randint(0,len(x_train)-1,n_batch) #Generates the random indexes for the microbatch generation, otheriwse memory kills my laptop
+        
         x_train_batch=x_train[idx]
         y_train_batch=y_train[idx]
 
-        x_validation_batch=x_validation[idx]
-        y_validation_batch=y_validation[idx]
-        
+
 
         y_pred=model(x_train_batch)
         loss=lossfn(y_pred,y_train_batch)
 
-        y_pred_validation=model(x_validation_batch) #Simply check the validation losses during training
-        loss_validation=lossfn(y_pred_validation,y_validation_batch)
+        y_pred_validation=model(x_validation) #Simply check the validation losses during training
+        loss_validation=lossfn(y_pred_validation,y_validation)
 
         if n%n_display==0: #To get an idea on training as it goes
             print(f'--------------\nCurrent epoch: {n}\nTraining_loss={loss.item()}\nValidation_loss={loss_validation.item()}')
-
-        if n%n_lowpass==0 and n>2.5*n_lowpass: #Check validation error running average whether it goes down
-            print(y_validation[y_validation!=0])
-            mean1=torch.mean(y_validation[y_validation!=0][-2*n_display:-n_display])
-            mean2=torch.mean(y_validation[y_validation!=0][-n_display:])
-
-            if mean2>mean1:
-                print("Validation increases again... Finishing training")
-                break    
-
+        
+        
         loss.backward()
         optimizer.step() #From the loss, the values of the gradient are obtained and stored in the y_pred, then they are updated with  optimiser.step with the learning rule determined earlier
 
@@ -190,9 +185,22 @@ if train:
         loss_train_arr[n]=loss.item()
         loss_validation_arr[n]=loss_validation.item()
 
+        if n%n_lowpass==0 and n>2.5*n_lowpass: #Check validation error running average whether it goes down
+
+            mean1=torch.mean(y_validation[y_validation!=0][-2*n_display:-n_display])
+            mean2=torch.mean(y_validation[y_validation!=0][-n_display:])
+        
+            if mean2>mean1:
+                print("Validation increases again... Finishing training")
+                break
+
+
+
     print("end of training epochs... moving to file saving and plotting")
 
     #Then let's save the model weights and save some plots for quick evaluation of the loss vs iter.
+
+    
     print("Saving files")
     torch.save(model.state_dict(),f"{Base_Directory}/ConvolutionalNeural_Net_Iter.2/Trained_Models/{model_name}/{model_name}.pth")
     np.savez_compressed(f"{Base_Directory}/ConvolutionalNeural_Net_Iter.2/Trained_Models/{model_name}/model_data.npz",loss_train_arr=loss_train_arr,loss_validation_arr=loss_validation_arr,ranges=ranges,images_std=images_std)
