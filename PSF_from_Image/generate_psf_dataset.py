@@ -141,6 +141,61 @@ class PSFGenerator:
         U_crop = U[self.crop, self.crop]
         return (U_crop.real**2 + U_crop.imag**2).astype(np.float64) / self.norm                  # intensity PSF in the crop window
 
+class TorchPSFGenerator:
+    """Same PSFs as PSFGenerator, but on the GPU (PyTorch) and for a whole batch of aberration vectors at once.
+    On top of the PSFGenerator tricks:
+      - no fftshift/ifftshift copies of the full n x n arrays: the aperture box is written straight into its ifftshifted position
+        and only the crop rows/columns are read back from the unshifted FFT (identical result, the shifts are just index offsets)
+      - binning and the energy sum also run on the GPU, so only the small binned images are copied back to the CPU."""
+
+    def __init__(self, voltage, alpha, pixel_size, n, crop, device="cuda"):
+        import torch
+        self.torch = torch
+        self.device = torch.device(device)
+        ref = PSFGenerator(voltage, alpha, pixel_size, n, crop)                       # reuse the CPU setup: same basis maps, aperture and norm
+        self.n = n
+        self.box_shape = ref.box_shape
+        self.basis = torch.from_numpy(ref.basis).to(self.device)                      # (m*m, 10) float32
+        self.aperture = torch.from_numpy(ref.aperture).to(self.device)                # (m, m) bool
+        self.aperture_f32 = self.aperture.float()
+        half = self.box_shape[0] // 2
+        self.box_idx = torch.arange(-half, half + 1, device=self.device) % n          # where the aperture box lands after ifftshift
+        self.crop_idx = torch.arange(-crop, crop, device=self.device) % n             # where the crop window sits before fftshift
+        self.norm = float(ref.norm)
+        self.name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else str(self.device)
+
+    def __call__(self, aberration_vectors, out_size):
+        """(B, 10) aberration vectors [m] -> binned PSFs (B, out_size, out_size) float32 and fraction of the PSF energy inside the crop (B,)."""
+        torch = self.torch
+        v = torch.as_tensor(np.asarray(aberration_vectors, dtype=np.float32), device=self.device)
+        B = v.shape[0]
+        phase = (self.basis @ v.T).T.reshape(B, *self.box_shape)
+
+        k = 4                                                                          # same coarse-grid sampling check as on the CPU
+        gy, gx = torch.gradient(phase[:, ::k, ::k], dim=(1, 2))
+        max_step = (torch.hypot(gx, gy)[:, self.aperture[::k, ::k]].max() / k).item()
+        if max_step > np.pi:
+            warnings.warn(f"Pupil phase undersampled ({max_step:.1f} rad/px > pi): increase n * pixel_size")
+
+        pupil = torch.zeros((B, self.n, self.n), dtype=torch.complex64, device=self.device)
+        pupil[:, self.box_idx[:, None], self.box_idx[None, :]] = torch.polar(self.aperture_f32.expand_as(phase), phase)   # P = A exp(j phase)
+        U = torch.fft.fft2(pupil)                                                      # complex PSF, still in unshifted order
+        del pupil
+        U = U.index_select(1, self.crop_idx).index_select(2, self.crop_idx)            # = fftshift(U)[crop, crop]
+        psf = (U.real**2 + U.imag**2) / self.norm                                      # intensity PSF in the crop window
+        energy = psf.sum(dim=(1, 2), dtype=torch.float64)
+        f = psf.shape[1] // out_size
+        binned = psf[:, :out_size * f, :out_size * f].reshape(B, out_size, f, out_size, f).sum(dim=(2, 4))
+        return binned.cpu().numpy(), energy.cpu().numpy()
+
+def cuda_available():
+    """True if PyTorch is installed and sees a CUDA GPU."""
+    try:
+        import torch
+    except ImportError:
+        return False
+    return torch.cuda.is_available()
+
 def bin_image(image, out_size):
     """Downsamples a square image to (out_size, out_size) by summing blocks of pixels (keeps the total intensity)."""
     factor = image.shape[0] // out_size
@@ -182,7 +237,8 @@ def format_time(seconds):
 
 def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072,
                               defocus=defocus_values, bounds=aberration_bounds, val_fraction=0.1, test_fraction=0.1, seed=0,
-                              filename=None, folder="Data", n_preview=3, checkpoint_every=10, n_workers=None):
+                              filename=None, folder="Data", n_preview=3, checkpoint_every=10, n_workers=None,
+                              device="auto", gpu_batch_sets=4):
     """Generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file.
     n_coefficients = 3, 7 or 9: which coefficients are random (see coefficient_sets); all others are exactly 0.
     filename = None gives a clear automatic name, e.g. psf_3coef_A1-C3_n1000.npz. The file contains:
@@ -200,6 +256,8 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
     settings and it continues where it stopped. The cache files are deleted once the final .npz is saved.
     n_workers = number of parallel processes (default: half the CPU threads). Each one uses roughly 0.5-1 GB of RAM,
     so lower it if your computer runs out of memory.
+    device = "auto" (GPU if PyTorch sees one, else CPU), "cuda" or "cpu". On the GPU, gpu_batch_sets sets (x3 PSFs) are computed
+    per FFT batch; each PSF needs roughly 0.35 GB of GPU memory at n = 3072, so lower it if you get a CUDA out-of-memory error.
     """
     folder = Path(__file__).parent / folder
     folder.mkdir(exist_ok=True)
@@ -245,31 +303,53 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
         tmp.write_text(json.dumps({"n_done": done, "settings": settings}))
         tmp.replace(cache_progress)                                        # atomic, so a crash while writing can't corrupt the progress file
 
-    if n_workers is None:
-        n_workers = max(1, (os.cpu_count() or 2) // 2)
-    print(f"Using {n_workers} worker process(es); setting up the PSF generator takes a few seconds per worker")
+    start = first = None
 
-    tasks = ((i, aberration_vectors[i], out_size) for i in range(n_done, n_samples))
-    start = None
-    with mp.Pool(n_workers, initializer=_init_worker, initargs=(voltage, alpha, pixel_size, n, crop)) as pool:
-        for i, stack, energy in pool.imap(_make_set, tasks):              # imap keeps the order, so the cache always holds sets 0..done-1
-            if start is None:
-                start, first = time.perf_counter(), i                     # time from the first finished set, so the setup doesn't skew the estimate
-            for j, e in enumerate(energy):
-                if e < 0.99:
-                    warnings.warn(f"Sample {i}, channel {j}: {100 * (1 - e):.1f}% of the PSF falls outside the crop window, increase crop (and n)")
-            images[i] = stack
-            if i < n_preview:
-                plt.imsave(preview_folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in stack]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
+    def handle(i, stack, energy):
+        """Stores one finished set (always called in order i = n_done, n_done+1, ...) and updates the cache and progress line."""
+        nonlocal start, first
+        if start is None:
+            start, first = time.perf_counter(), i                         # time from the first finished set, so the setup doesn't skew the estimate
+        for j, e in enumerate(energy):
+            if e < 0.99:
+                warnings.warn(f"Sample {i}, channel {j}: {100 * (1 - e):.1f}% of the PSF falls outside the crop window, increase crop (and n)")
+        images[i] = stack
+        if i < n_preview:
+            plt.imsave(preview_folder / f"preview_{i:05d}.png", np.hstack([im / im.max() for im in stack]), cmap="inferno", origin="lower")   # each panel scaled to its own max (preview only)
 
-            done = i + 1
-            if done % checkpoint_every == 0 or done == n_samples:
-                save_progress(done)
-            if done % 10 == 0 or done == n_samples:
-                elapsed = time.perf_counter() - start
-                rate = elapsed / max(done - first - 1, 1)                 # seconds per set in this run
-                print(f"\rGenerated {done}/{n_samples} PSF sets ({100 * done / n_samples:.1f}%) | "
-                      f"elapsed {format_time(elapsed)} | remaining ~{format_time(rate * (n_samples - done))}", end="", flush=True)
+        done = i + 1
+        if done % checkpoint_every == 0 or done == n_samples:
+            save_progress(done)
+        if done % 10 == 0 or done == n_samples:
+            elapsed = time.perf_counter() - start
+            rate = elapsed / max(done - first - 1, 1)                     # seconds per set in this run
+            print(f"\rGenerated {done}/{n_samples} PSF sets ({100 * done / n_samples:.1f}%) | "
+                  f"elapsed {format_time(elapsed)} | remaining ~{format_time(rate * (n_samples - done))}", end="", flush=True)
+
+    if device == "auto":
+        device = "cuda" if cuda_available() else "cpu"
+
+    if device != "cpu":
+        # ----- GPU: one process, gpu_batch_sets sets (x3 defocus values) per batched FFT -----
+        generator = TorchPSFGenerator(voltage, alpha, pixel_size, n, crop, device)
+        print(f"Using GPU: {generator.name} ({gpu_batch_sets} sets per batch)")
+        n_channels = len(defocus)
+        for b in range(n_done, n_samples, gpu_batch_sets):
+            batch = aberration_vectors[b:b + gpu_batch_sets]              # (S, 3, 10)
+            binned, energy = generator(batch.reshape(-1, batch.shape[-1]), out_size)
+            binned = binned.reshape(len(batch), n_channels, out_size, out_size)
+            energy = energy.reshape(len(batch), n_channels)
+            for s in range(len(batch)):
+                handle(b + s, binned[s], energy[s])
+    else:
+        # ----- CPU: parallel worker processes, one set per task -----
+        if n_workers is None:
+            n_workers = max(1, (os.cpu_count() or 2) // 2)
+        print(f"Using CPU: {n_workers} worker process(es); setting up the PSF generator takes a few seconds per worker")
+        tasks = ((i, aberration_vectors[i], out_size) for i in range(n_done, n_samples))
+        with mp.Pool(n_workers, initializer=_init_worker, initargs=(voltage, alpha, pixel_size, n, crop)) as pool:
+            for i, stack, energy in pool.imap(_make_set, tasks):          # imap keeps the order, so the cache always holds sets 0..done-1
+                handle(i, stack, energy)
     print()
 
     active_bounds = bounds[active_mask]
@@ -299,7 +379,7 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
 def main():
     # n_coefficients = 3 (A1, C3), 7 (A1, B2, A2, C3) or 9 (all). Every type gets its own file, cache and preview folder,
     # e.g. Data/psf_3coef_A1-C3_n1000.npz, Data/psf_7coef_A1-B2-A2-C3_n1000.npz, Data/psf_9coef_A1-B2-A2-C3-A3_n1000.npz
-    generate_training_dataset(n_samples=1000, n_coefficients=9)
+    generate_training_dataset(n_samples=10000, n_coefficients=9)
 
 if __name__ == "__main__":
     main()
