@@ -1,5 +1,7 @@
 # Convolutional Neural Network V2
 
+This CNN also now takes a through focus series as a trining set, (so two input channels)
+
 This CNN code allows for easier tuning of hyperparameters as well as GPU acceleration with Nvidia's CUDA platform.
 In order to run the code with CUDA follow the tutorial [here](https://www.geeksforgeeks.org/deep-learning/how-to-use-gpu-acceleration-in-pytorch/)
 
