@@ -64,10 +64,10 @@ coefficient_sets = {3: ["A1r", "A1i", "C3"],
                     7: ["A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3"],
                     9: aberration_labels}
 
-def dataset_name(n_coefficients, n_samples):
-    """Clear filename, e.g. 'psf_3coef_A1-C3_n1000.npz' or 'psf_7coef_A1-B2-A2-C3_n1000.npz'."""
+def dataset_name(n_coefficients, n_samples, tag=""):
+    """Clear filename, e.g. 'psf_3coef_A1-C3_n1000.npz' or, with tag='_grid0.1_train', 'psf_3coef_A1-C3_grid0.1_train_n1331.npz'."""
     groups = list(dict.fromkeys(label.rstrip("ri") for label in coefficient_sets[n_coefficients]))   # A1r, A1i -> A1 (C3 stays C3)
-    return f"psf_{n_coefficients}coef_{'-'.join(groups)}_n{n_samples}.npz"
+    return f"psf_{n_coefficients}coef_{'-'.join(groups)}{tag}_n{n_samples}.npz"
 
 ##################################################################################################################################################################################################################
 """PSF generation"""
@@ -212,10 +212,44 @@ def make_aberration_sets(n_samples, active=aberration_labels, defocus=defocus_va
     mask = np.isin(aberration_labels, active)
     shared = np.zeros((n_samples, len(bounds)))
     shared[:, mask] = rng.uniform(bounds[mask, 0], bounds[mask, 1], size=(n_samples, mask.sum()))
-    sets = np.empty((n_samples, len(defocus), len(bounds) + 1))
+    return shared, sets_from_shared(shared, defocus)
+
+def sets_from_shared(shared, defocus=defocus_values):
+    """Coefficients (N, 9) [m] -> full aberration sets (N, len(defocus), 10): the same coefficients for every vector, only C1 differs."""
+    sets = np.empty((len(shared), len(defocus), shared.shape[1] + 1))
     sets[:, :, 0] = defocus                     # C1 per vector in the set
     sets[:, :, 1:] = shared[:, None, :]         # same other coefficients for all vectors in the set
-    return shared, sets
+    return sets
+
+def grid_axes(n_coefficients, step, bounds=aberration_bounds, midpoints=False):
+    """Grid values of each active coefficient, as (start, step, count) arrays of shape (K,): values = start + step * arange(count) [m].
+    step = float: step as a fraction of each coefficient's range, e.g. 0.25 -> low, low + 25%, ..., high = 5 points per coefficient
+                  (on the network's [-1, 1] label scale that is a step of 2 * 0.25 = 0.5)
+           dict:  step in meters per coefficient, keyed by label ('A1r') or by group ('A1' = A1r and A1i), e.g. {'A1': 0.5e-6, 'C3': 0.5e-3}
+    The grid starts at low and ends at the last step that still fits (= high when the range is a whole number of steps).
+    midpoints = True gives the points halfway between neighbouring grid points instead (one fewer per coefficient): none of them is on the grid."""
+    active = coefficient_sets[n_coefficients]
+    idx = [aberration_labels.index(label) for label in active]
+    low, high = bounds[idx, 0], bounds[idx, 1]
+    if isinstance(step, dict):
+        steps = []
+        for label in active:
+            key = label if label in step else label.rstrip("ri")
+            if key not in step:
+                raise ValueError(f"No step given for {label}: add '{label}' or '{label.rstrip('ri')}' to the step dict")
+            steps.append(step[key])
+        steps = np.array(steps, dtype=float)
+    else:
+        steps = float(step) * (high - low)
+    if np.any(steps <= 0):
+        raise ValueError("Grid steps must be > 0")
+    counts = np.floor((high - low) / steps + 1e-9).astype(int) + 1
+    start = low.astype(float)
+    if midpoints:
+        start, counts = start + steps / 2, counts - 1
+        if np.any(counts < 1):
+            raise ValueError("The step is larger than the range of some coefficient, so there are no midpoints")
+    return start, steps, counts
 
 _worker_generator = None
 
@@ -239,7 +273,7 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
                               defocus=defocus_values, bounds=aberration_bounds, val_fraction=0.1, test_fraction=0.1, seed=0,
                               filename=None, folder="Data", n_preview=3, checkpoint_every=10, n_workers=None,
                               device="auto", gpu_batch_sets=4):
-    """Generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file.
+    """RANDOM dataset: generates n_samples sets of 3 aberration vectors (same coefficients, C1 = +5 um, 0, -5 um) and saves everything in one file.
     n_coefficients = 3, 7 or 9: which coefficients are random (see coefficient_sets); all others are exactly 0.
     filename = None gives a clear automatic name, e.g. psf_3coef_A1-C3_n1000.npz. The file contains:
       images              (N, 3, out_size, out_size) float32  -> one PSF per vector in the set, binned from the (2*crop)^2 center
@@ -259,20 +293,169 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
     device = "auto" (GPU if PyTorch sees one, else CPU), "cuda" or "cpu". On the GPU, gpu_batch_sets sets (x3 PSFs) are computed
     per FFT batch; each PSF needs roughly 0.35 GB of GPU memory at n = 3072, so lower it if you get a CUDA out-of-memory error.
     """
+    if n_coefficients not in coefficient_sets:
+        raise ValueError(f"n_coefficients must be one of {list(coefficient_sets)}")
+    active = coefficient_sets[n_coefficients]
+    if filename is None:
+        filename = dataset_name(n_coefficients, n_samples)
+    print(f"Dataset {filename}: random coefficients {active}, all others 0")
+
+    shared, _ = make_aberration_sets(n_samples, active, defocus, bounds, seed)   # deterministic from seed, so a resumed run gets the same vectors
+
+    idx = np.random.default_rng(seed + 1).permutation(n_samples)
+    n_test = int(test_fraction * n_samples)
+    n_val = int(val_fraction * n_samples)
+    test_idx, val_idx, train_idx = idx[:n_test], idx[n_test:n_test + n_val], idx[n_test + n_val:]
+
+    _generate_dataset(shared, n_coefficients, filename, folder, out_size, crop, voltage, alpha, pixel_size, n, defocus, bounds,
+                      n_preview, checkpoint_every, n_workers, device, gpu_batch_sets,
+                      cache_settings=dict(seed=seed), extra_fields=dict(train_idx=train_idx, val_idx=val_idx, test_idx=test_idx))
+
+_generators = {}
+
+def _shared_generator(voltage, alpha, pixel_size, n, crop, device):
+    """One TorchPSFGenerator per microscope setting, shared by all grid datasets (its basis maps take ~0.3 GB of GPU memory)."""
+    key = (voltage, alpha, pixel_size, n, crop, device)
+    if key not in _generators:
+        _generators[key] = TorchPSFGenerator(voltage, alpha, pixel_size, n, crop, device)
+    return _generators[key]
+
+class GridPSFDataset:
+    """GRID dataset that is never saved: the PSFs are computed (on the GPU) at the moment they are asked for.
+    Every sample is fully determined by its index (index -> position on the grid -> coefficients), so only the grid definition is stored.
+    Nothing is kept: only the batch that is being used is in memory, and it is freed as soon as you move on to the next one.
+    Main use, one epoch = one pass over the whole grid in batches:
+        for images, labels in dataset.batches(batch_size=500):
+            ...  # train on this batch; the next one is already being made in the background meanwhile
+        -> images (B, C, out_size, out_size) float32 tensor, one channel per defocus value (C = len(defocus))
+           labels (B, K) float32 tensor, the active coefficients scaled to [-1, 1] within their bounds (same as 'labels' in the .npz files)
+    Or ask for specific samples (made right then, also not kept): images, labels = dataset[idx]   (idx = int, list/array or slice)
+    step: the grid spacing, see grid_axes (a float = fraction of each coefficient's range, or a dict with a step in meters per coefficient).
+    midpoints = False: the grid points (training); True: the midpoints between them, i.e. only values NOT in the training grid (validation).
+    defocus: which C1 values become the channels, e.g. defocus_values[[0, 2]] for just +5 um and -5 um (also 1/3 less computing).
+    Also has: len(dataset), coefficients(idx) [m], labels(idx), aberration_vectors(idx), bounds, label_names, image_std()."""
+
+    def __init__(self, step, n_coefficients=3, midpoints=False, defocus=defocus_values,
+                 out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072, bounds=aberration_bounds,
+                 device="auto", out_device="cpu", gpu_batch_psfs=12):
+        if n_coefficients not in coefficient_sets:
+            raise ValueError(f"n_coefficients must be one of {list(coefficient_sets)}")
+        if (2 * crop) % out_size != 0 or crop > n // 2:
+            raise ValueError("2*crop must be divisible by out_size and crop must be <= n // 2")
+        if device == "auto":
+            device = "cuda" if cuda_available() else "cpu"
+
+        self.step = step
+        self.n_coefficients = n_coefficients
+        self.label_names = coefficient_sets[n_coefficients]
+        self._idx = [aberration_labels.index(label) for label in self.label_names]
+        self.bounds = np.asarray(bounds)[self._idx]                               # (K, 2) [m], same as 'bounds' in the .npz files
+        self.grid_start, self.grid_step, self.grid_count = grid_axes(n_coefficients, step, np.asarray(bounds), midpoints)
+        self.split = "val" if midpoints else "train"
+        self.defocus = np.asarray(defocus, dtype=float)
+        self.out_size = out_size
+        self.out_device = out_device
+        self.gpu_batch_psfs = gpu_batch_psfs                                      # PSFs per FFT batch: ~0.25 GB of GPU memory each
+        self.binned_pixel_size = pixel_size * (2 * crop // out_size)
+        self.n_sets = int(np.prod(self.grid_count))
+        self._generator = _shared_generator(voltage, alpha, pixel_size, n, crop, device)
+
+        seconds = self.n_sets * len(self.defocus) / 3 * (0.025 if device != "cpu" else 1.3)   # measured: ~0.025 s per 3 PSFs on an RTX 3070
+        print(f"Grid {self.split} set over {self.label_names}: {' x '.join(str(c) for c in self.grid_count)} = {self.n_sets} sets "
+              f"x {len(self.defocus)} channels, made batch by batch on {self._generator.name} (~{format_time(seconds)} per pass over the grid)")
+
+    def __len__(self):
+        return self.n_sets
+
+    def coefficients(self, indices):
+        """Active coefficients [m] (B, K) of these sample indices: the grid position follows from the index (last coefficient changes fastest)."""
+        position = np.stack(np.unravel_index(np.atleast_1d(indices), self.grid_count), axis=-1)
+        return self.grid_start + self.grid_step * position
+
+    def labels(self, indices):
+        """Coefficients scaled to [-1, 1] within their bounds (B, K), what the network predicts."""
+        low, high = self.bounds[:, 0], self.bounds[:, 1]
+        return (2 * (self.coefficients(indices) - low) / (high - low) - 1).astype(np.float32)
+
+    def aberration_vectors(self, indices):
+        """Full vectors [C1, A1r, ..., A3i] [m] (B, C, 10), one per channel; inactive coefficients are 0."""
+        shared = np.zeros((len(np.atleast_1d(indices)), len(aberration_labels)))
+        shared[:, self._idx] = self.coefficients(indices)
+        return sets_from_shared(shared, self.defocus)
+
+    def _generate(self, indices):
+        """Computes the PSF sets of these indices -> (B, C, out_size, out_size) float32 numpy array."""
+        vectors = self.aberration_vectors(indices).reshape(-1, len(aberration_labels) + 1)
+        images = np.empty((len(vectors), self.out_size, self.out_size), dtype=np.float32)
+        for b in range(0, len(vectors), self.gpu_batch_psfs):
+            binned, energy = self._generator(vectors[b:b + self.gpu_batch_psfs], self.out_size)
+            images[b:b + len(binned)] = binned
+            if energy.min() < 0.99:
+                warnings.warn(f"{100 * (1 - energy.min()):.1f}% of a PSF falls outside the crop window, increase crop (and n)")
+        return images.reshape(-1, len(self.defocus), self.out_size, self.out_size)
+
+    def __getitem__(self, idx):
+        import torch
+        if not isinstance(idx, slice):
+            idx = np.asarray(idx)
+        single = isinstance(idx, np.ndarray) and idx.ndim == 0
+        indices = np.atleast_1d(np.arange(self.n_sets)[idx])                   # handles int, slice, list, array, negative indices
+        images = torch.from_numpy(self._generate(indices)).to(self.out_device)
+        labels = torch.from_numpy(self.labels(indices)).to(self.out_device)
+        return (images[0], labels[0]) if single else (images, labels)
+
+    def n_batches(self, batch_size=500):
+        """Number of batches in one pass over the grid (the last one can be smaller)."""
+        return -(-self.n_sets // batch_size)
+
+    def batches(self, batch_size=500, shuffle=True, seed=None, prefetch=True):
+        """One pass (epoch) over the whole grid: yields (images, labels) batches of batch_size sets, in a new random order every
+        call when shuffle=True (seed=None). Every grid point is used exactly once per pass.
+        Each batch is made just before it is needed and freed once you move on to the next one (nothing is stored).
+        prefetch=True makes the next batch in a background thread while you train on the current one, so the PSF generation
+        and the training overlap; that keeps at most 2 batches in memory (~65 MB each for 500 sets x 2 channels).
+        prefetch=False: exactly 1 batch in memory, but training waits while every batch is made."""
+        order = np.random.default_rng(seed).permutation(self.n_sets) if shuffle else np.arange(self.n_sets)
+        chunks = [order[b:b + batch_size] for b in range(0, self.n_sets, batch_size)]
+        if not prefetch:
+            for chunk in chunks:
+                yield self[chunk]
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            upcoming = pool.submit(self.__getitem__, chunks[0])
+            for k in range(len(chunks)):
+                batch = upcoming.result()
+                if k + 1 < len(chunks):
+                    upcoming = pool.submit(self.__getitem__, chunks[k + 1])   # start the next batch before handing this one over
+                yield batch
+                del batch                                                     # drop our reference, so the batch is freed once you're done with it
+
+    def image_std(self, n_samples=500, seed=0):
+        """Standard deviation of all pixel values (what the CNN divides the images by), from n_samples random grid points (all if fewer)."""
+        n_samples = min(n_samples, self.n_sets)
+        indices = np.sort(np.random.default_rng(seed).choice(self.n_sets, n_samples, replace=False))
+        return float(self[indices][0].double().std())
+
+def grid_datasets(step, n_coefficients=3, **kwargs):
+    """Training grid + validation grid (the midpoints between the training points, so values the network never saw).
+    Takes the same arguments as GridPSFDataset, e.g. train_set, val_set = grid_datasets(0.1, 3, defocus=defocus_values[[0, 2]])."""
+    return (GridPSFDataset(step, n_coefficients, midpoints=False, **kwargs),
+            GridPSFDataset(step, n_coefficients, midpoints=True, **kwargs))
+
+def _generate_dataset(shared, n_coefficients, filename, folder, out_size, crop, voltage, alpha, pixel_size, n, defocus, bounds,
+                      n_preview, checkpoint_every, n_workers, device, gpu_batch_sets, cache_settings, extra_fields):
+    """Engine shared by generate_training_dataset and generate_grid_dataset: makes one PSF set (len(defocus) images) per row of
+    shared (N, 9) [m], with caching/resume, and saves one .npz with the common fields plus extra_fields."""
     folder = Path(__file__).parent / folder
     folder.mkdir(exist_ok=True)
     if (2 * crop) % out_size != 0 or crop > n // 2:
         raise ValueError("2*crop must be divisible by out_size and crop must be <= n // 2")
 
-    if n_coefficients not in coefficient_sets:
-        raise ValueError(f"n_coefficients must be one of {list(coefficient_sets)}")
     active = coefficient_sets[n_coefficients]
     active_mask = np.isin(aberration_labels, active)
-    if filename is None:
-        filename = dataset_name(n_coefficients, n_samples)
-    print(f"Dataset {filename}: random coefficients {active}, all others 0")
-
-    shared, aberration_vectors = make_aberration_sets(n_samples, active, defocus, bounds, seed)   # deterministic from seed, so a resumed run gets the same vectors
+    n_samples = len(shared)
+    aberration_vectors = sets_from_shared(shared, defocus)
 
     # ----- Cache: images are written straight to a .npy file on disk, progress is saved every checkpoint_every sets -----
     stem = Path(filename).stem
@@ -282,7 +465,7 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
     if n_preview > 0:
         preview_folder.mkdir(exist_ok=True)
     settings = dict(n_samples=n_samples, n_coefficients=n_coefficients, out_size=out_size, crop=crop, voltage=voltage, alpha=alpha,
-                    pixel_size=pixel_size, n=n, defocus=np.asarray(defocus).tolist(), bounds=np.asarray(bounds).tolist(), seed=seed)
+                    pixel_size=pixel_size, n=n, defocus=np.asarray(defocus).tolist(), bounds=np.asarray(bounds).tolist(), **cache_settings)
     shape = (n_samples, len(defocus), out_size, out_size)
 
     n_done = 0
@@ -357,17 +540,11 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
     labels = (2 * (shared[:, active_mask] - low) / (high - low) - 1).astype(np.float32)   # only the active coefficients, all on the same [-1, 1] scale,
                                                                                             # otherwise C3 (e-3) dominates the loss over A1 (e-7)
 
-    idx = np.random.default_rng(seed + 1).permutation(n_samples)
-    n_test = int(test_fraction * n_samples)
-    n_val = int(val_fraction * n_samples)
-    test_idx, val_idx, train_idx = idx[:n_test], idx[n_test:n_test + n_val], idx[n_test + n_val:]
-
     np.savez_compressed(folder / filename, images=np.asarray(images), labels=labels, aberration_vectors=aberration_vectors,
                         defocus_values=np.asarray(defocus), bounds=active_bounds, label_names=np.array(active), vector_labels=np.array(vector_labels),
                         n_coefficients=n_coefficients, active_mask=active_mask,
-                        train_idx=train_idx, val_idx=val_idx, test_idx=test_idx,
                         voltage=voltage, alpha=alpha, pixel_size=pixel_size,
-                        binned_pixel_size=pixel_size * (2 * crop // out_size))
+                        binned_pixel_size=pixel_size * (2 * crop // out_size), **extra_fields)
     print(f"Saved {n_samples} samples to {folder / filename}")
 
     del images                                                             # close the memmap before deleting the cache
@@ -377,9 +554,28 @@ def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=11
 """Run this file"""
 
 def main():
+    make_random = False     # random coefficients, saved to one file with a train/val/test split inside
+    check_grid = True       # grid data is NOT saved: this only builds the on-the-fly grid datasets and makes one batch as a check
+
     # n_coefficients = 3 (A1, C3), 7 (A1, B2, A2, C3) or 9 (all). Every type gets its own file, cache and preview folder,
     # e.g. Data/psf_3coef_A1-C3_n1000.npz, Data/psf_7coef_A1-B2-A2-C3_n1000.npz, Data/psf_9coef_A1-B2-A2-C3-A3_n1000.npz
-    generate_training_dataset(n_samples=10000, n_coefficients=9)
+    if make_random:
+        generate_training_dataset(n_samples=10000, n_coefficients=9)
+
+    # step = fraction of each coefficient's range: 0.1 -> 11 values per coefficient, 0.25 -> 5, 0.5 -> 3 (low, middle, high).
+    # Or a step in meters per coefficient, e.g. step={"A1": 0.2e-6, "C3": 0.5e-3}.
+    # Sets = (values per coefficient)^n_coefficients, e.g. step 0.1 with 3 coefficients: train 11^3 = 1331, val (midpoints) 10^3 = 1000.
+    # Nothing is saved: every batch is made when it is needed and freed afterwards. In the CNN (add the PSF_from_Image folder to sys.path first):
+    #     from generate_psf_dataset import grid_datasets, defocus_values
+    #     train_set, val_set = grid_datasets(step=0.1, n_coefficients=3, defocus=defocus_values[[0, 2]])   # channels +5 um and -5 um
+    #     for epoch in range(n_epochs):
+    #         for x_batch, y_batch in train_set.batches(batch_size=500):                                  # (500, 2, 128, 128), (500, 3)
+    #             ...  # one training step
+    if check_grid:
+        train_set, val_set = grid_datasets(step=0.1, n_coefficients=3, defocus=defocus_values[[0, 2]])
+        for k, (x, y) in enumerate(train_set.batches(batch_size=500)):
+            print(f"Check: batch {k + 1}/{train_set.n_batches(500)}: images {tuple(x.shape)}, labels {tuple(y.shape)} "
+                  f"in [{y.min():.2f}, {y.max():.2f}]")
 
 if __name__ == "__main__":
     main()

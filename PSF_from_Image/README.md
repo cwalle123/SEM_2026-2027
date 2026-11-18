@@ -8,7 +8,7 @@ Simulates wave-optical point spread functions (PSFs) of an SEM electron probe fr
 |---------------------------|----------------------------------------------------------------------------------------------------------|
 | `WavePSF0.py`             | The old PSF script from Noah, kept as the reference for the wave-optical PSF calculation                 |
 | `psf_viewer.py`           | Computes a single PSF from one aberration vector and plots the PSF intensity to see what it looks like.  |
-| `generate_psf_dataset.py` | Makes training data: random aberration vectors with 3 set C1 + their images → `Data/psf_<k>coef_….npz`.  |
+| `generate_psf_dataset.py` | Makes training data: random aberration vectors with 3 set C1 + their images → `Data/psf_<k>coef_….npz`. **NEW GRID METHOD HERE:** also makes grid data on the fly for the CNN, without saving anything (see [Grid dataset](#new-grid-method-here-grid-dataset-made-on-the-fly-nothing-saved)). |
 | `Data/`                   | Output folder for the dataset and the preview images.                                                    |
 
 ## How the PSF is calculated
@@ -59,7 +59,13 @@ This plots the PSF for `example_abberation_vector` at the top of the file (by de
 python generate_psf_dataset.py
 ```
 
-By default this generates 1000 samples of the 3-coefficient dataset. In `main()`, change `n_samples` for more or fewer samples and `n_coefficients` (3, 7 or 9) for the dataset type.
+> **NEW GRID METHOD HERE:** `main()` now has two switches at the top:
+> - `make_random`: makes and saves the random dataset described in this section (10 000 samples of the 9-coefficient type). It is `False` by default, so running the file doesn't regenerate it.
+> - `check_grid`: builds the grid datasets and runs one pass over the grid as a check. It is `True` by default, and nothing is saved. See [Grid dataset](#new-grid-method-here-grid-dataset-made-on-the-fly-nothing-saved).
+
+For the random dataset, set `make_random = True` in `main()`. Change `n_samples` for more or fewer samples, and `n_coefficients` (3, 7 or 9) for the dataset type.
+
+The PSFs are computed on the GPU (PyTorch + CUDA) when one is available, and on the CPU with parallel worker processes otherwise. On an RTX 3070 one set of 3 PSFs takes about 0.025 s, so 10 000 samples take about 4 minutes. Use `device="cpu"` or `device="cuda"` to force one or the other.
 
 ### Dataset types
 
@@ -111,7 +117,9 @@ The 5 µm defocus alone already spreads the beam over ±100 nm of the ±173 nm c
 | `out_size`                      | 128                  | Final image size after binning (18 × 18 pixels summed → 2.7 nm pixels)      |
 | `val_fraction`, `test_fraction` | 0.1, 0.1             | Fixed 80 / 10 / 10 train / validation / test split                          |
 | `seed`                          | 0                    | Makes the dataset reproducible                                              |
-| `n_workers`                     | Half the CPU threads | Parallel processes. Each uses 0.5–1GB of RAM, so lower if run out of memory |
+| `n_workers`                     | Half the CPU threads | Parallel processes (CPU only). Each uses 0.5–1GB of RAM, so lower if run out of memory |
+| `device`                        | `"auto"`             | `"auto"` = GPU if PyTorch sees one, else CPU; or force `"cuda"` / `"cpu"`   |
+| `gpu_batch_sets`                | 4                    | Sets (× 3 PSFs) per GPU FFT batch, ~2.8 GB of GPU memory. Lower it on a CUDA out-of-memory error |
 
 `2 * crop` must be divisible by `out_size`, and `crop` must be at most `n // 2`. The script warns if more than 1% of a PSF falls outside the crop window. If you see that warning, increase `crop` (and `n`).
 
@@ -158,6 +166,82 @@ coefficients_m = low + (predictions + 1) / 2 * (high - low)
 
 The images are normalised so that the full PSF sums to 1, which makes the pixel values very small. You will probably want to rescale each image (for example, divide by its maximum) before feeding it to the CNN.
 
+## NEW GRID METHOD HERE: Grid dataset (made on the fly, nothing saved)
+
+The random dataset above draws coefficients at random. The grid dataset uses **every combination of fixed values** inside `aberration_bounds` instead, so you know exactly which values the network was trained on. The validation set uses only values that are **not** in the training grid.
+
+Nothing is written to disk. Each sample is fully determined by its index (index → position on the grid → coefficients), so only the grid definition is stored. The PSFs are computed on the GPU at the moment the CNN asks for them, one batch at a time, and each batch is freed once training moves on to the next one.
+
+### The grid
+
+`step` sets the spacing:
+
+- **A number** is a fraction of each coefficient's range. `0.1` gives 11 values per coefficient (low, low + 10 %, …, high), `0.25` gives 5, and `0.5` gives 3 (low, middle, high). On the [−1, 1] label scale, the step is `2 * step`.
+- **A dict** gives a step in metres per coefficient, keyed by label (`"A1r"`) or by group (`"A1"` = A1r and A1i). For example `step={"A1": 0.2e-6, "C3": 0.5e-3}`.
+
+The grid starts at the low bound and ends at the last step that still fits, which is the high bound when the range is a whole number of steps.
+
+- **Training grid:** all grid points.
+- **Validation grid:** all **midpoints** between neighbouring grid points, which gives one fewer value per coefficient. None of them is in the training grid, so validation always tests values the network has never seen. With `step=0.5`, the training labels are {−1, 0, 1} and the validation labels are {−0.5, 0.5}.
+
+The number of sets is (values per coefficient)^K, which grows very fast with the number of coefficients K:
+
+| `n_coefficients` | `step` | Training sets   | Validation sets | One pass over the training grid (RTX 3070, 2 channels) |
+|------------------|--------|-----------------|-----------------|--------------------------------------------------------|
+| 3                | 0.1    | 11³ = 1331      | 10³ = 1000      | ~22 s                                                  |
+| 3                | 0.05   | 21³ = 9261      | 20³ = 8000      | ~2.5 min                                               |
+| 9                | 0.5    | 3⁹ = 19 683     | 2⁹ = 512        | ~5.5 min                                               |
+| 9                | 0.25   | 5⁹ ≈ 2 million  | 4⁹ = 262 144    | ~9 hours                                               |
+
+With 7 or 9 coefficients, the grid can only be very coarse. That is why the random dataset is the better choice there. The grid works best with 3 coefficients.
+
+### Usage in the CNN
+
+To check the grid without the CNN, run `python generate_psf_dataset.py` with `check_grid = True` in `main()`. It builds the step-0.1, 3-coefficient grids and runs one pass over the training grid in batches of 500. It prints each batch's shape and saves nothing.
+
+To train on the grid, use the datasets like this in the CNN script:
+
+```python
+import sys
+sys.path.append(f"{Base_Directory}/PSF_from_Image")          # so the CNN can import the generator
+from generate_psf_dataset import grid_datasets, defocus_values
+
+# Training grid + validation grid (midpoints between the training points)
+train_set, val_set = grid_datasets(step=0.1, n_coefficients=3,
+                                   defocus=defocus_values[[0, 2]])   # channels: +5 µm and -5 µm
+
+for epoch in range(n_epochs):
+    for x_batch, y_batch in train_set.batches(batch_size=500):    # (500, 2, 128, 128), (500, 3)
+        optimizer.zero_grad()
+        loss = lossfn(model(x_batch), y_batch)
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():                                         # validation, also batch by batch
+        val_loss = sum(lossfn(model(x), y).item() * len(y) for x, y in val_set.batches(500)) / len(val_set)
+```
+
+The CNN in `ConvolutionalNeural_Net_Iter.2` does not use this yet. It still loads a saved `.npz` file.
+
+### Options and helpers
+
+| What                                                    | Meaning                                                                                                                                      |
+|---------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| `grid_datasets(step, n_coefficients, **options)`        | Returns `(train_set, val_set)`. The options are the same as for `GridPSFDataset`                                                            |
+| `GridPSFDataset(step, n_coefficients, midpoints=False)` | One grid. `midpoints=True` gives the validation grid                                                                                        |
+| `defocus=defocus_values[[0, 2]]`                        | Which C1 values become the image channels. The default is all 3 (+5, 0, −5 µm); fewer channels means less computing                         |
+| `.batches(batch_size=500, shuffle=True, prefetch=True)` | One epoch: every grid point exactly once, in a new random order every call                                                                  |
+| `prefetch=True`                                         | Makes the next batch in a background thread while the CNN trains on the current one: at most 2 batches in memory (~65 MB each for 500 × 2 channels) |
+| `prefetch=False`                                        | Exactly 1 batch in memory, but training waits while each batch is made (~3.3 s per 500 sets × 2 channels)                                   |
+| `dataset[idx]`                                          | Specific samples (int, list/array or slice), made right then and not kept                                                                   |
+| `len(dataset)`, `.n_batches(batch_size)`                | Number of sets, and number of batches per epoch                                                                                             |
+| `.labels(idx)`, `.coefficients(idx)`, `.aberration_vectors(idx)` | Labels in [−1, 1], coefficients in metres, and the full 10-number vectors, all without making the images                           |
+| `.bounds`, `.label_names`                               | Same as in the `.npz` files, to convert predicted labels back to metres                                                                     |
+| `.image_std()`                                          | Standard deviation of the pixel values from a random sample of the grid, to standardise the images like the CNN does now                    |
+| `device`, `out_device`                                  | Where the PSFs are computed (`"auto"` = GPU if available) and where the returned tensors go (default `"cpu"`)                                |
+
+The images and labels come back as float32 PyTorch tensors. They are scaled the same way as the `images` and `labels` in the saved `.npz` files.
+
 ## To do
 
 - [ ] Add the Gaussian blur for the finite source size (`d50geo`) from `WavePSF0.py`, to `psf_viewer.py` and `generate_psf_dataset.py`.
@@ -168,3 +252,4 @@ The images are normalised so that the full PSF sums to 1, which makes the pixel 
 - numpy
 - scipy (used for the multi-threaded FFT in `generate_psf_dataset.py`)
 - matplotlib
+- PyTorch with CUDA, for the GPU. **NEW GRID METHOD HERE:** the grid dataset always needs PyTorch, and runs on the CPU when there is no GPU. The random dataset works without PyTorch, but then runs on the CPU only.
