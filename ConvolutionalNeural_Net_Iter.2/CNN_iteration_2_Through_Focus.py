@@ -285,7 +285,7 @@ if evaluation_mode:
 
         ###Analysis of single PSF's performance by the CNN
         print(np.shape(images))
-        imidx=910 #index of interest
+        imidx=999 #index of interest
         
         input=torch.Tensor.reshape(images[imidx],(1,n_in_channels,image_size,image_size)) #Proper conditioning for the CNN with the corresponding validation batch
         out=(model(input))[0]
