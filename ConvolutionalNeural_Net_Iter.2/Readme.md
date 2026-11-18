@@ -1,4 +1,4 @@
-# Convolutional Neural Network V2
+# Convolutional Neural Network Iteration 2
 
 This CNN also now takes a through focus series as a trining set, (so two input channels)
 
