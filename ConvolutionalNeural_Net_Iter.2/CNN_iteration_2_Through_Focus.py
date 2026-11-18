@@ -9,16 +9,16 @@ import os
 ####################################
 #Hyperparameters and setup
 ####################################
-np.random.seed(1)
+np.random.seed(1) #Set random seed for repeatabilitly of results
 
 #Functionalities
-train=True #To determine weights and saves the parameters
-evaluation_mode=False #Loads parameters and used for model inference
+train=False #To determine weights and saves the parameters
+evaluation_mode=True #Loads parameters and used for model inference
 dataset_analysis_mode=False #Used for evaluation of the dataset fed into the CNN
 
 #Input-putput_details
 n_predicted_coeffs=9 #Dimensionality of the output vector (for now this is either 3,7 or 9)
-model_name=f"CNN_iteration_2_v2_{n_predicted_coeffs}"
+model_name=f"CNN_iteration_2_v3_{n_predicted_coeffs}"
 
 image_size=128 #square images considered (imagesize x imageize)
 n_in_channels=2 #Images taken as input onto the CNN
@@ -28,8 +28,8 @@ file_name="psf_9coef_A1-B2-A2-C3-A3_n1000.npz" #name of the dataset you want to 
 #Other
 n_datapoints_plotting = 100 #Number of datapoints used for plotting in total
 n_display=10#epochs between prints of losses display
-n_batch=300 #Determines batch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
-n_lowpass=50 #Window used for early validation stop whether the general tendency is to increaso er decrease despite noise
+n_batch=400 #Determines batch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+n_lowpass=150 #Window used for early validation stop whether the general tendency is to increaso er decrease despite noise
 n_save=100 #Epochs per save made
 n_epochs=5000
 
@@ -52,7 +52,7 @@ class CNN(torch.nn.Module):
         self.conv_pass_1=torch.nn.Sequential(torch.nn.Conv2d(n_in_channels,16,(9,9),stride=1,padding="same"),torch.nn.ReLU(),torch.nn.Conv2d(16,32,(5,5),stride=1,padding="same"),torch.nn.ReLU(),torch.nn.MaxPool2d(max_pool_1)) #Yields 64x64 @ 32
         self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(32,32,(3,3),padding="same"),torch.nn.ReLU(),torch.nn.Conv2d(32,16,(3,3),padding="same"),torch.nn.ReLU(),torch.nn.MaxPool2d(max_pool_2)) #Yields  16 @ 32x32 
         #self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(64,32,(3,3)stride=1,padding="same"),)
-        self.dense=torch.nn.Sequential(torch.nn.Flatten(),torch.nn.Dropout(p=0.1),torch.nn.Linear(int(16*((image_size*image_size)/(max_pool_2**2*max_pool_1**2))),1000),torch.nn.ReLU(),torch.nn.Linear(1000,n_predicted_coeffs)) #All follows from max pooling reaulting size and number of channels
+        self.dense=torch.nn.Sequential(torch.nn.Flatten(),torch.nn.Dropout(p=0.2),torch.nn.Linear(int(16*((image_size*image_size)/(max_pool_2**2*max_pool_1**2))),1000),torch.nn.ReLU(),torch.nn.Linear(1000,n_predicted_coeffs)) #All follows from max pooling reaulting size and number of channels
     
     def forward(self,x):
         #For forward pass
@@ -67,6 +67,8 @@ class CNN(torch.nn.Module):
 
 
 model=CNN()
+
+
 lossfn=torch.nn.MSELoss(reduction="mean") #Loss function class employed
 optimizer=torch.optim.Adam(model.parameters(),lr=learning_rate) #Optimiser class used for weight updates
 
@@ -139,13 +141,21 @@ if train:
     y_train=torch.tensor(y_train).to(torch.float32)
     y_validation=torch.tensor(y_validation).to(torch.float32)
 
+
+    #Passes everything to GPU so it is on the same environment as the model, which avoida having to back and froth from CPU to GPU
+
+    x_train=x_train.to('cuda')
+    x_validation=x_validation.to('cuda')
+    y_train=y_train.to('cuda')
+    y_validation=y_validation.to('cuda')
+
 ############
 #Training
 ############
 
 
 if train:
-    
+    model=model.to('cuda') #Uses GPU acceleration moves model to GPU :D
     loss_train_arr=np.zeros(n_epochs)
     loss_validation_arr=np.zeros(n_epochs)
     #Loop n_epoch times over the batch
@@ -186,10 +196,10 @@ if train:
         loss_validation_arr[n]=loss_validation.item()
 
         if n%n_lowpass==0 and n>2.5*n_lowpass: #Check validation error running average whether it goes down
-
-            mean1=torch.mean(y_validation[y_validation!=0][-2*n_display:-n_display])
-            mean2=torch.mean(y_validation[y_validation!=0][-n_display:])
-        
+            
+            mean1=np.mean(loss_validation_arr[loss_validation_arr!=0][int(-2*n_display):-n_display])
+            mean2=np.mean(loss_validation_arr[loss_validation_arr!=0][-n_display:])
+          
             if mean2>mean1:
                 print("Validation increases again... Finishing training")
                 break
@@ -275,14 +285,12 @@ if evaluation_mode:
 
         ###Analysis of single PSF's performance by the CNN
         print(np.shape(images))
-        imidx=810 #index of interest
+        imidx=910 #index of interest
         
         input=torch.Tensor.reshape(images[imidx],(1,n_in_channels,image_size,image_size)) #Proper conditioning for the CNN with the corresponding validation batch
         out=(model(input))[0]
         
-        print(ranges[:,0])
-        print(ranges[:,1])
-
+    
         out=(ranges[:,0]+(out+1)/2*(ranges[:,1]-ranges[:,0])).detach().numpy()
         ref=((ranges[:,0]+(vectors[imidx]+1)/2*(ranges[:,1]-ranges[:,0]))).detach().numpy()
         print(out)
