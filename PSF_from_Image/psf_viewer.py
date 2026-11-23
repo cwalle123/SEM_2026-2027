@@ -1,121 +1,135 @@
 # External imports
+import sys
 import warnings
+from pathlib import Path
 import numpy as np
+import torch
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-# Internal imports
+# Internal imports: the PSFs are made with the exact same code as the CNN training data, so the viewer can never drift from it
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate_psf_dataset import (PSFGenerator, TorchPSFGenerator, aberration_function, aberration_bounds, aberration_labels,
+                                  bin_image, cuda_available, defocus_values, electron_wavelength, sets_from_shared)
 
 ##################################################################################################################################################################################################################
 """Constants"""
 
-# Example abberation coefficients for testing the PSF generation
-c1  = 0e-6                # defocus [meter]        (e-6)
+# Example aberration coefficients for testing, order [A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i] (same as aberration_labels).
+# There is no C1 here: like in the training data, C1 is set by the defocus channels (cnn_defocus).
+# Keep the values inside aberration_bounds, otherwise the CNN is asked about PSFs it never saw during training.
 a1r = 0;      a1i = 0;      # astigmatism            (e-8)
 b2r = 0;      b2i = 0;      # coma                   (e-6)
-a2r = 40e-6;      a2i = 10e-6;  # 3-fold astigmatism     (e-6)
+a2r = 15e-6;  a2i = 10e-6;  # 3-fold astigmatism     (e-6)
+c3  = 1e-3                  # spherical aberration   (e-3), always > 0 in the training data
 a3r = 0;      a3i = 0;      # 4-fold astigmatism     (e-4)
-c3  = 0                     # spherical abberation   (e-3)
-example_abberation_vector = np.array([c1, a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i])   # order: C3 comes before A3
+example_aberration_vector = np.array([a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i])   # order: C3 comes before A3
 
-electron_charge = 1.602176634e-19       # [C]
-V = 30000                               # Voltage [V]
-h = 6.62607015e-34                      # Planck's constant [J*s]
-c = 299792458                           # Speed of light [m/s]
-electron_mass = 9.10938356e-31          # Electron mass [kg]
-electron_wavelength = h / np.sqrt(2 * electron_mass * electron_charge * V + (1 / c**2 ) * (electron_charge * V)**2)  # Relativistic electron wavelength [m] for an accelerating voltage [V]
+V = 30000                                   # Voltage [V]
+
+# Settings of the most recent CNN (ConvolutionalNeural_Net_Iter.2/CNN_iteration_2_Through_Focus.py): it takes channels [0, 2] of the
+# dataset, i.e. C1 = +5 um and -5 um, and divides the images by the pixel std of the training set (images_std in model_data.npz).
+cnn_defocus = defocus_values[[0, 2]]        # C1 [m] per input channel
+cnn_model_name = "CNN_iteration_2_v2_9_double_learning_rate"   # model folder whose model_data.npz holds images_std
+cnn_models_folder = Path(__file__).resolve().parent.parent / "ConvolutionalNeural_Net_Iter.2" / "Trained_Models"
 
 ##################################################################################################################################################################################################################
-"""Functions to generate PSFs from abberation coefficients """
+"""Functions to generate the CNN input from aberration coefficients"""
 
-def abberation_function(tx, ty, alpha, aberration_vector):
-    """phi(x', y') [m]: Zernike-balanced wave aberration over a circular aperture.
-    tx, ty = ray angles [rad], alpha = half opening angle [rad].
-    aberration_vector = [C1, A1r, A1i, B2r, B2i, A2r, A2i, C3, A3r, A3i] in meters."""
-    C1  = aberration_vector[0]
-    A1r = aberration_vector[1];    A1i = aberration_vector[2]
-    B2r = aberration_vector[3];    B2i = aberration_vector[4]
-    A2r = aberration_vector[5];    A2i = aberration_vector[6]
-    C3  = aberration_vector[7]
-    A3r = aberration_vector[8];    A3i = aberration_vector[9]
+def load_images_std(model_name=cnn_model_name):
+    """images_std (float32) the CNN divided its input by during training, from Trained_Models/<model_name>/model_data.npz."""
+    path = cnn_models_folder / model_name / "model_data.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"No {path}: train that model first, pick another model_name, or pass images_std yourself")
+    return np.load(path)["images_std"]
 
-    tx2 = tx**2;   ty2 = ty**2;   al2 = alpha**2
-    S  = 0.5*C1*(tx2 + ty2) + 0.5*A1r*(tx2 - ty2) + A1i*tx*ty                    # defocus, 2-fold astigmatism:   Re{1/2 w w* C1 + 1/2 w*^2 A1}
-    S += (B2r*tx - B2i*ty)*(tx2 + ty2 - (2/3)*al2)                               # coma (tilt-balanced):          Re{w^2 w* B2}
-    S += A2r*tx*((tx2/3) - ty2) + A2i*ty*(tx2 - (ty2/3))                         # 3-fold astigmatism:            Re{1/3 w*^3 A2}
-    S += 0.25*C3*(tx2 + ty2)*(tx2 + ty2 - al2)                                   # spherical (defocus-balanced):  Re{1/4 (w w*)^2 C3}
-    S += 0.25*(A3r*(tx**4 + ty**4 - 6*tx2*ty2) + A3i*(4*tx*ty*(tx2 - ty2)))      # 4-fold astigmatism:            Re{1/4 w*^4 A3}, same 1/n prefactor pattern as A1 and A2
-    return S
+def shared_coefficients(aber):
+    """[A1r, ..., A3i] (9) or a full vector [C1, A1r, ..., A3i] (10) -> the 9 coefficients the defocus channels share.
+    C1 of a full vector is dropped (with a warning if it is not 0): the defocus channels set C1, exactly like in the training data."""
+    aber = np.asarray(aber, dtype=float)
+    if aber.shape == (len(aberration_labels) + 1,):
+        if aber[0] != 0:
+            warnings.warn(f"C1 = {aber[0]:.2e} m is ignored: the CNN channels use C1 = {', '.join(f'{d:+.0e}' for d in cnn_defocus)} m")
+        aber = aber[1:]
+    if aber.shape != (len(aberration_labels),):
+        raise ValueError(f"Expected {len(aberration_labels)} coefficients {aberration_labels} (or 10 with C1 in front), got shape {aber.shape}")
+    outside = (aber < aberration_bounds[:, 0]) | (aber > aberration_bounds[:, 1])
+    if outside.any():
+        warnings.warn(f"{[label for label, o in zip(aberration_labels, outside) if o]} outside the training bounds: the CNN never saw such PSFs")
+    return aber
 
-def pupil_function(n, pixel_size, wavelength, alpha, aber):
-    """P(x', y') = A(x', y') * exp(j 2pi/lambda * phi(x', y'))   (Eq. 3 and 4)."""
-    dtheta = wavelength / (n * pixel_size) # angular step, chosen so that the FFT lands on image pixels of size pixel_size
-    if n * dtheta / 2 < alpha:
-        raise ValueError(f"Aperture doesn't fit: need pixel_size < {wavelength / (2 * alpha):.3e} m")
-    theta = (np.arange(n) - n // 2) * dtheta
+def make_aberration_psf(aber, images_std=None, model_name=cnn_model_name, defocus=cnn_defocus, device="auto",
+                        voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072, crop=1152, out_size=128):
+    """Aberration coefficients [m] -> the exact input of the most recent CNN: a float32 tensor of shape (1, len(defocus), out_size, out_size).
+    aber = [A1r, ..., A3i] (9 values) or [C1, A1r, ..., A3i] (10 values, C1 is ignored).
+    Same pipeline as the training data (generate_psf_dataset.generate_training_dataset with its default settings) and the CNN script:
+      1. one aberration vector per defocus channel, C1 = +5 um and -5 um, all other coefficients shared
+      2. intensity PSF on an n x n grid, cropped to the central 2*crop pixels, normalized so the full PSF sums to 1
+      3. binned (summed) to out_size x out_size, float32
+      4. divided by images_std, the pixel std of the training set (loaded from the model's model_data.npz when images_std is None)
+    device = "auto" (GPU if PyTorch sees one, else CPU), "cuda" or "cpu", same choice the dataset generator makes."""
+    shared = shared_coefficients(aber)
+    vectors = sets_from_shared(shared[None, :], defocus)[0]                  # (C, 10): one full vector per channel
+    if images_std is None:
+        images_std = load_images_std(model_name)
+
+    if device == "auto":
+        device = "cuda" if cuda_available() else "cpu"
+    if device != "cpu":
+        binned, energy = TorchPSFGenerator(voltage, alpha, pixel_size, n, crop, device)(vectors, out_size)
+    else:
+        generator = PSFGenerator(voltage, alpha, pixel_size, n, crop)
+        psis = [generator(vector) for vector in vectors]
+        binned = np.stack([bin_image(p, out_size) for p in psis]).astype(np.float32)
+        energy = np.array([p.sum() for p in psis])
+    if energy.min() < 0.99:
+        warnings.warn(f"{100 * (1 - energy.min()):.1f}% of a PSF falls outside the crop window, the CNN input is clipped")
+
+    images = binned[None] / np.float32(images_std)                          # (1, C, H, W) float32, standardized like in the CNN script
+    return torch.from_numpy(images).to(torch.float32)
+
+def pupil_phases(aber, defocus=cnn_defocus, voltage=V, alpha=20e-3, n_points=401):
+    """Pupil phase 2pi/lambda * phi [rad] per defocus channel on a square grid just around the aperture (NaN outside), for plotting only."""
+    wavelength = electron_wavelength(voltage)
+    theta = np.linspace(-1.1 * alpha, 1.1 * alpha, n_points)
     TX, TY = np.meshgrid(theta, theta)
-    A = (np.hypot(TX, TY) <= alpha).astype(float)
-    phi = abberation_function(TX, TY, alpha, aber)
-    P = A * np.exp(1j * 2 * np.pi / wavelength * phi)
+    inside = np.hypot(TX, TY) <= alpha
+    vectors = sets_from_shared(shared_coefficients(aber)[None, :], defocus)[0]
+    phases = [np.where(inside, 2 * np.pi / wavelength * aberration_function(TX, TY, alpha, v), np.nan) for v in vectors]
+    return theta, phases
 
-    phase = 2 * np.pi / wavelength * phi
-    gy, gx = np.gradient(phase)
-    max_step = np.max(np.hypot(gx, gy)[A > 0])
-    if max_step > np.pi:
-        warnings.warn(f"Pupil phase undersampled ({max_step:.1f} rad/px > pi): increase n")
-    return theta, A, phase, P
+##################################################################################################################################################################################################################
+"""Plotting"""
 
-def make_aberration_psf(aber, voltage=V, alpha=20e-3, pixel_size=20e-12, n=2048):
-    """Aberration coefficients [m] -> intensity PSF Psi(x, y), normalized to sum 1."""
-    
-    wavelength = h / np.sqrt(2 * electron_mass * electron_charge * voltage + (1 / c**2 ) * (electron_charge * voltage)**2)
-    theta, A, phase, P = pupil_function(n, pixel_size, wavelength, alpha, aber)
+def plot_cnn_input(cnn_input, aber, defocus=cnn_defocus, alpha=20e-3, pixel_size=150e-12, crop=1152):
+    """One row per CNN input channel: pupil phase, CNN input (linear) and CNN input (log scale)."""
+    images = cnn_input[0].detach().cpu().numpy()
+    half = images.shape[-1] * pixel_size * (2 * crop // images.shape[-1]) / 2 * 1e9      # half width of the image [nm]
+    psf_extent = [-half, half, -half, half]
+    theta, phases = pupil_phases(aber, defocus, alpha=alpha)
+    pupil_extent = [theta[0] * 1e3, theta[-1] * 1e3, theta[0] * 1e3, theta[-1] * 1e3]
 
-    # The complex PSF U(x, y) is the Fourier transform of the pupil function P(x', y')
-    U = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(P)))
-    # Intensity PSF Psi(x, y) = |U(x, y)|^2, normalized to sum 1 (replaces the 1/(pi theta^2) prefactor) so it can be used as a convolution kernel
-    psi = np.abs(U)**2
-    psi /= psi.sum()
+    fig, axes = plt.subplots(len(images), 3, figsize=(17, 5 * len(images)), squeeze=False)
+    for row, (image, phase, c1) in zip(axes, zip(images, phases, defocus)):
+        ax1, ax2, ax3 = row
+        im1 = ax1.imshow(np.angle(np.exp(1j * phase)), origin="lower", extent=pupil_extent, cmap="twilight", vmin=-np.pi, vmax=np.pi)
+        ax1.add_patch(plt.Circle((0, 0), alpha * 1e3, fill=False, color="k", lw=1))
+        ax1.set_title(f"Pupil phase  2π/λ·φ(x', y'),  C1 = {c1 * 1e6:+.0f} µm")
+        ax1.set_xlabel("θx [mrad]"); ax1.set_ylabel("θy [mrad]")
+        cb1 = fig.colorbar(im1, ax=ax1, shrink=0.85, label="Phase [rad]")
+        cb1.set_ticks([-np.pi, 0, np.pi]); cb1.set_ticklabels(["−π", "0", "π"])
 
-    x = (np.arange(n) - n // 2) * pixel_size
-    phase_masked = np.where(A > 0, phase, np.nan)
-    return theta, x, phase_masked, psi
+        im2 = ax2.imshow(image, origin="lower", extent=psf_extent, cmap="inferno")
+        ax2.set_title(f"CNN input, C1 = {c1 * 1e6:+.0f} µm")
+        ax2.set_xlabel("x [nm]"); ax2.set_ylabel("y [nm]")
+        fig.colorbar(im2, ax=ax2, shrink=0.85, label="Ψ / images_std")
 
-def plot_psf(theta, x, phase, psi, alpha, crop=600):
-    """This function plots the pupil phase and the PSF intensity (linear and log scale).
-    crop = half width of the PSF window around the center [px]."""
-    c = len(x) // 2
-    s = slice(c - crop, c + crop)                                   # PSF window around the center
-    a = np.abs(theta) <= 1.1 * alpha                                # only the angles around the aperture
-    x_nm = x[s] * 1e9
-    th_mrad = theta[a] * 1e3
-    psf_extent = [x_nm[0], x_nm[-1], x_nm[0], x_nm[-1]]
-    pupil_extent = [th_mrad[0], th_mrad[-1], th_mrad[0], th_mrad[-1]]
+        im3 = ax3.imshow(image, origin="lower", extent=psf_extent, cmap="inferno", norm=LogNorm(vmin=image.max() * 1e-4, vmax=image.max()))
+        ax3.set_title(f"CNN input, C1 = {c1 * 1e6:+.0f} µm, log scale")
+        ax3.set_xlabel("x [nm]"); ax3.set_ylabel("y [nm]")
+        fig.colorbar(im3, ax=ax3, shrink=0.85, label="Ψ / images_std")
 
-    wrapped_phase = np.angle(np.exp(1j * phase[np.ix_(a, a)]))      # wrap to [-pi, pi], NaN outside the aperture stays NaN
-    psi_crop = psi[s, s]
-
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(17, 5.2))
-
-    im1 = ax1.imshow(wrapped_phase, origin="lower", extent=pupil_extent, cmap="twilight", vmin=-np.pi, vmax=np.pi)
-    ax1.add_patch(plt.Circle((0, 0), alpha * 1e3, fill=False, color="k", lw=1))
-    ax1.set_title("Pupil phase  2π/λ·φ(x', y')")
-    ax1.set_xlabel("θx [mrad]"); ax1.set_ylabel("θy [mrad]")
-    cb1 = fig.colorbar(im1, ax=ax1, shrink=0.85, label="Phase [rad]")
-    cb1.set_ticks([-np.pi, 0, np.pi]); cb1.set_ticklabels(["−π", "0", "π"])
-
-    im2 = ax2.imshow(psi_crop, origin="lower", extent=psf_extent, cmap="inferno")
-    ax2.set_title("PSF intensity Ψ(x, y)")
-    ax2.set_xlabel("x [nm]"); ax2.set_ylabel("y [nm]")
-    fig.colorbar(im2, ax=ax2, shrink=0.85, label="Ψ (normalized)")
-
-    im3 = ax3.imshow(psi_crop, origin="lower", extent=psf_extent, cmap="inferno",
-                     norm=LogNorm(vmin=psi_crop.max() * 1e-4, vmax=psi_crop.max()))
-    ax3.set_title("PSF intensity Ψ(x, y), log scale")
-    ax3.set_xlabel("x [nm]"); ax3.set_ylabel("y [nm]")
-    fig.colorbar(im3, ax=ax3, shrink=0.85, label="Ψ (normalized)")
-
-    for ax in (ax1, ax2, ax3):
-        ax.set_aspect("equal")
+        for ax in row:
+            ax.set_aspect("equal")
 
     plt.tight_layout()
     plt.show()
@@ -125,8 +139,9 @@ def plot_psf(theta, x, phase, psi, alpha, crop=600):
 
 def main():
     """This functions runs everything from this file"""
-    theta, x, phase, psi = make_aberration_psf(example_abberation_vector, voltage=V, alpha=20e-3, pixel_size=150e-12, n=2048)
-    plot_psf(theta=theta, x=x, phase=phase, psi=psi, alpha=20e-3, crop=600)
+    cnn_input = make_aberration_psf(example_aberration_vector)
+    print(f"CNN input: {tuple(cnn_input.shape)} {cnn_input.dtype}, min {cnn_input.min():.3g}, max {cnn_input.max():.3g}")
+    plot_cnn_input(cnn_input, example_aberration_vector)
 
 if __name__ == "__main__":
     main() # makes sure this only runs if you run *this* file, not if this file is imported somewhere else
