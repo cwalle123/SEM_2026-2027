@@ -84,8 +84,37 @@ def make_aberration_psf(aber, images_std=None, model_name=cnn_model_name, defocu
     if energy.min() < 0.99:
         warnings.warn(f"{100 * (1 - energy.min()):.1f}% of a PSF falls outside the crop window, the CNN input is clipped")
 
-    images = binned[None] / np.float32(images_std)                          # (1, C, H, W) float32, standardized like in the CNN script
+    images = binned[None] / np.float32(images_std)                        # (1, C, H, W) float32, standardized like in the CNN script
     return torch.from_numpy(images).to(torch.float32)
+
+def make_aberration_psf_nostd(aber, defocus=cnn_defocus, device="auto",
+                        voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072, crop=1152, out_size=128):
+    """Aberration coefficients [m] -> the exact input of the most recent CNN: a float32 tensor of shape (1, len(defocus), out_size, out_size).
+    aber = [A1r, ..., A3i] (9 values) or [C1, A1r, ..., A3i] (10 values, C1 is ignored).
+    Same pipeline as the training data (generate_psf_dataset.generate_training_dataset with its default settings) and the CNN script:
+      1. one aberration vector per defocus channel, C1 = +5 um and -5 um, all other coefficients shared
+      2. intensity PSF on an n x n grid, cropped to the central 2*crop pixels, normalized so the full PSF sums to 1
+      3. binned (summed) to out_size x out_size, float32
+      4. This version does not standarise the output, makes it easier for CNN code implementation :D
+    device = "auto" (GPU if PyTorch sees one, else CPU), "cuda" or "cpu", same choice the dataset generator makes."""
+    shared = shared_coefficients(aber)
+    vectors = sets_from_shared(shared[None, :], defocus)[0]                  # (C, 10): one full vector per channel
+
+    if device == "auto":
+        device = "cuda" if cuda_available() else "cpu"
+    if device != "cpu":
+        binned, energy = TorchPSFGenerator(voltage, alpha, pixel_size, n, crop, device)(vectors, out_size)
+    else:
+        generator = PSFGenerator(voltage, alpha, pixel_size, n, crop)
+        psis = [generator(vector) for vector in vectors]
+        binned = np.stack([bin_image(p, out_size) for p in psis]).astype(np.float32)
+        energy = np.array([p.sum() for p in psis])
+    if energy.min() < 0.99:
+        warnings.warn(f"{100 * (1 - energy.min()):.1f}% of a PSF falls outside the crop window, the CNN input is clipped")
+
+    images = binned[None]                        # (1, C, H, W) float32, standardized like in the CNN script
+    return torch.from_numpy(images).to(torch.float32)  #So then to the right outout format, in this case with no standarisation
+
 
 def pupil_phases(aber, defocus=cnn_defocus, voltage=V, alpha=20e-3, n_points=401):
     """Pupil phase 2pi/lambda * phi [rad] per defocus channel on a square grid just around the aperture (NaN outside), for plotting only."""
@@ -139,9 +168,8 @@ def plot_cnn_input(cnn_input, aber, defocus=cnn_defocus, alpha=20e-3, pixel_size
 
 def main():
     """This functions runs everything from this file"""
-    cnn_input = make_aberration_psf(example_aberration_vector)
-    print(f"CNN input: {tuple(cnn_input.shape)} {cnn_input.dtype}, min {cnn_input.min():.3g}, max {cnn_input.max():.3g}")
-    plot_cnn_input(cnn_input, example_aberration_vector)
-
+    cnn_input = make_aberration_psf_nostd([example_aberration_vector])
+    print(np.shape(cnn_input))
+    print(cnn_input)
 if __name__ == "__main__":
     main() # makes sure this only runs if you run *this* file, not if this file is imported somewhere else

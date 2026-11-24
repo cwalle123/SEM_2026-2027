@@ -1,3 +1,5 @@
+
+import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -5,18 +7,40 @@ import tqdm
 from pathlib import Path
 import os
 
+#In order t consider the PSF function packages:
+Base_Directory=Path(__file__).resolve().parent.parent #gets the git root to access other folders
+sys.path.insert(1, f'{Base_Directory}/PSF_from_Image')
+import psf_viewer
 
 ####################################
 #Hyperparameters and setup
 ####################################
+
+
+
 np.random.seed(1) #Set random seed for repeatabilitly of results
 
-#Functionalities
+###Functionalities
+
 train=False #To determine weights and saves the parameters
 evaluation_mode=True #Loads parameters and used for model inference
 dataset_analysis_mode=False #Used for evaluation of the dataset fed into the CNN
 
-#Input-putput_details
+#Validation analyis quick inputs
+valanalysis=False
+autosave=True #keeps images
+
+singleanalysis=True #For a single aberration vector to check
+a1r = 0;      a1i = 0;      # astigmatism            (e-8)
+b2r = 0;      b2i = 0;      # coma                   (e-6)
+a2r = 0;  a2i = 0;          # 3-fold astigmatism     (e-6)
+c3  = 0                     # spherical aberration   (e-3), always > 0 in the training data
+a3r = 700e-6;      a3i = 0e-6;      # 4-fold astigmatism     (e-4)
+
+validation_analysis_vector=np.array([a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i]) #Same structure as the PSF analysis
+
+#Input-output_details
+
 n_predicted_coeffs=9 #Dimensionality of the output vector (for now this is either 3,7 or 9)
 model_name=f"CNN_iteration_2_v3_{n_predicted_coeffs}"
 
@@ -80,7 +104,6 @@ optimizer=torch.optim.Adam(model.parameters(),lr=learning_rate) #Optimiser class
 
 #Reqired initialisation for accessing files
 
-Base_Directory=Path(__file__).resolve().parent.parent #gets the git root to access other folders
 exists=os.path.isdir(f"{Base_Directory}/ConvolutionalNeural_Net_Iter.2/Trained_Models/{model_name}")
 
 if exists and train:
@@ -231,8 +254,7 @@ if train:
 #Plotting and evaluation of the model
 #######################################
 
-singleanalysis=True
-valanalysis=False
+
 
 if evaluation_mode:
 
@@ -283,31 +305,41 @@ if evaluation_mode:
 
     if singleanalysis:
 
-        ###Analysis of single PSF's performance by the CNN
-        print(np.shape(images))
-        imidx=999 #index of interest
-        
-        input=torch.Tensor.reshape(images[imidx],(1,n_in_channels,image_size,image_size)) #Proper conditioning for the CNN with the corresponding validation batch
-        out=(model(input))[0]
-        
-    
-        out=(ranges[:,0]+(out+1)/2*(ranges[:,1]-ranges[:,0])).detach().numpy()
-        ref=((ranges[:,0]+(vectors[imidx]+1)/2*(ranges[:,1]-ranges[:,0]))).detach().numpy()
-        print(out)
-        print(ref)
 
+    
+        ###Analysis of single PSF's performance by the CNN
+
+
+        input=psf_viewer.make_aberration_psf_nostd(validation_analysis_vector) #Size should be correct, (1,2,128,128) for the resolutions studied
+        input=input/sigma #Normalise
+        out=(model(input))[0]
+    
+        out=(ranges[:,0]+(out+1)/2*(ranges[:,1]-ranges[:,0])).detach().numpy() # To bring it back to the correct units
+        ref=validation_analysis_vector
+    
+        reconstruction=psf_viewer.make_aberration_psf_nostd(out)/sigma #Recreated PSF w predicted coeffs for the same through focus
+        err_image=np.abs(input-reconstruction)
+    
+        
 
         #Plotting results nicely
+        np.set_printoptions(linewidth=100,formatter={"float": lambda x: f"{x:.2e}"})
         vector_values_labels=np.array(["A1r", "A1i", "B2r", "B2i", "A2r", "A2i", "C3", "A3r", "A3i"])
         x=np.array(range(len(vector_values_labels)))
 
-        plt.suptitle(f"{model_name} evaluation on index {imidx}")
+        fig = plt.figure(figsize=(12, 6), layout="constrained")
+
+
+        print(f'Real. vector: {ref}')
+        print(f'Pred. vector {out}')
+        
+        plt.suptitle(f"{model_name} evaluation on predefined vector")
 
         plt.subplot(131)
-        plt.imshow(images[imidx][0])
+        plt.imshow(input[0,0])
         plt.colorbar()
         plt.subplot(132)
-        plt.imshow(images[imidx][1])
+        plt.imshow(input[0,1])
         plt.colorbar()
         plt.subplot(133)
         plt.xticks(x,vector_values_labels)
@@ -316,8 +348,60 @@ if evaluation_mode:
         plt.bar(x,(out-ref)/ref*100,width=0.2)
         #plt.bar(x,ref/ref)
         plt.ylabel("Relative error [%]")
-        plt.show()
     
+        plt.savefig(f'{Base_Directory}\ConvolutionalNeural_Net_Iter.2\Analysis/{model_name}_{validation_analysis_vector}_1.png')
+        plt.show()
+        
+
+        
+        fig = plt.figure(figsize=(12, 8), layout="constrained") #Plot PSf as built VS real one and check out the redonsrtruction errors visually, both standarised!!
+        fig.get_layout_engine().set(rect=(0, 0.12, 1, 0.88))
+        
+
+        plt.subplot(231) # The recreated PSF
+        plt.title("Recreated overfocus")
+        plt.imshow(reconstruction[0,0])      
+        plt.colorbar()
+
+        plt.subplot(234) # The recreated PSF
+        plt.title("Recreated underfocus")
+        plt.imshow(reconstruction[0,1])      
+        plt.colorbar()
+
+        plt.subplot(232) # The original PSF series
+        plt.title("Original overfocus")
+        plt.imshow(input[0,0]) #Overfocused C1=5mum
+        plt.colorbar()
+
+        plt.subplot(235) # The original PSF series
+        plt.title("Original underfocus")
+        plt.imshow(input[0,1]) #Underfocused C1=-5mum
+        plt.colorbar()
+
+        plt.subplot(233)
+        plt.title("Reconstruction errors overfocused")
+        plt.imshow(err_image[0,0],cmap="hot")
+        plt.colorbar()
+
+        plt.subplot(236)
+        plt.title("Reconstruction errors underfocused")
+        plt.imshow(err_image[0,1],cmap="hot")
+        plt.colorbar()
+        
+        #Text alinment and formatting for easier to read in second plot
+        def fmt(a, width=10, prec=2):
+            return " ".join(f"{x:>{width}.{prec}e}" for x in (a))
+
+        def fmt_labels(labels, width=10):
+            return " ".join(f"{l:>{width}}" for l in labels)
+
+        width = 10
+        fig.text(0.5, 0.04,
+                f"{'':6}{fmt_labels(vector_values_labels, width)}\n" f"Real. {fmt(ref, width)}\n" f"Pred. {fmt(out, width)}", ha="center", family="monospace", multialignment="left")
+        
+        plt.savefig(f'{Base_Directory}\ConvolutionalNeural_Net_Iter.2\Analysis/{model_name}_{validation_analysis_vector}_2.png')
+        plt.show()
+
 
 
 
