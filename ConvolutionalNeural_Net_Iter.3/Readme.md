@@ -42,11 +42,11 @@ Validation_loss=0.0005967800971120596
 ```
 ## Some results and comparaison with iter.2's V3
 
-### V3
+### Iter.3
 <img width="1917" height="937" alt="image" src="https://github.com/user-attachments/assets/624deff8-7cc9-4543-a1fa-712ab3e415bc" />
 <img width="1895" height="932" alt="image" src="https://github.com/user-attachments/assets/727bf6e2-5ff2-4886-9faa-534c6d203af3" />
 
-### V2
+### Iter.2
 <img width="1487" height="977" alt="image" src="https://github.com/user-attachments/assets/83e23832-e1b9-4ae5-8caf-a8174de23741" />
 <img width="1200" height="800" alt="image" src="https://github.com/user-attachments/assets/56bdb070-4374-4aee-a2e5-f4e0f7d7e345" />
 
