@@ -50,4 +50,9 @@ Validation_loss=0.0005967800971120596
 <img width="1487" height="977" alt="image" src="https://github.com/user-attachments/assets/83e23832-e1b9-4ae5-8caf-a8174de23741" />
 <img width="1200" height="800" alt="image" src="https://github.com/user-attachments/assets/56bdb070-4374-4aee-a2e5-f4e0f7d7e345" />
 
+
+### Validation overview 
+
+<img width="1881" height="927" alt="image" src="https://github.com/user-attachments/assets/63a68d9c-913b-440e-a0cf-e64550bef3e9" />
+
 ### Version V2
