@@ -33,9 +33,9 @@ autosave=True #keeps images
 singleanalysis=True #For a single aberration vector to check
 a1r = 0;      a1i = 0;      # astigmatism            (e-8)
 b2r = 0;      b2i = 0;      # coma                   (e-6)
-a2r = 0;  a2i = 0;          # 3-fold astigmatism     (e-6)
-c3  = 0                     # spherical aberration   (e-3), always > 0 in the training data
-a3r = 700e-6;      a3i = 0e-6;      # 4-fold astigmatism     (e-4)
+a2r = 1e-6;  a2i = 1e-6;          # 3-fold astigmatism     (e-6)
+c3  = 0e-3                     # spherical aberration   (e-3)
+a3r = 0e-6;      a3i = 0e-6;      # 4-fold astigmatism     (e-4)
 
 validation_analysis_vector=np.array([a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i]) #Same structure as the PSF analysis
 
