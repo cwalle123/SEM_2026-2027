@@ -1,6 +1,7 @@
 
 PSF_from_Image/Data/*.npz
 Data/*.npz
+PDF_from_Image/Data (V2 format)/*.npz
 ConvolutionalNeural_Net_Iter.3/Trained_Models/**/*.pth
 ConvolutionalNeural_Net_Iter.3/Trained_Models/**/*.npz
 ConvolutionalNeural_Net_Iter.2/Trained_Models/**/*.pth

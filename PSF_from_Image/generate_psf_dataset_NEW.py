@@ -271,7 +271,7 @@ def format_time(seconds):
 
 def generate_training_dataset(n_samples, n_coefficients=9, out_size=128, crop=1152, voltage=V, alpha=20e-3, pixel_size=150e-12, n=3072,
                               defocus=defocus_values, bounds=aberration_bounds, val_fraction=0.1, test_fraction=0.1, seed=0,
-                              filename=None, folder="Data", n_preview=3, checkpoint_every=10, n_workers=None,
+                              filename=None, folder="Data (V2 format)", n_preview=3, checkpoint_every=10, n_workers=None,
                               device="auto", gpu_batch_sets=4):
     """RANDOM dataset: generates n_samples sets of 2 aberration vectors (same coefficients, C1 = +5 um, -5 um) and saves everything in one file.
     n_coefficients = 3, 7 or 9: which coefficients are random (see coefficient_sets); all others are exactly 0.

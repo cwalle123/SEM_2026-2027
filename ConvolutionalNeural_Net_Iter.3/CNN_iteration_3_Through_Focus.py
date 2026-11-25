@@ -9,7 +9,7 @@ import os
 
 #In order t consider the PSF function packages:
 Base_Directory=Path(__file__).resolve().parent.parent #gets the git root to access other folders
-sys.path.insert(1, f'{Base_Directory}')
+sys.path.insert(1, f'{Base_Directory}/PSF_from_Image')
 import generate_psf_dataset_NEW as psf_gen #Same generator that made the dataset: channels C1 = +5 um and -5 um, labels = c / (high - low)
 
 ####################################
@@ -17,79 +17,100 @@ import generate_psf_dataset_NEW as psf_gen #Same generator that made the dataset
 ####################################
 
 
-
-np.random.seed(1) #Set random seed for repeatabilitly of results
-
-###Functionalities
-
-train=True #To determine weights and saves the parameters
-evaluation_mode=False #Loads parameters and used for model inference
-dataset_analysis_mode=False #Used for evaluation of the dataset fed into the CNN
-
-#Validation analyis quick inputs
-valanalysis=False
-autosave=True #keeps images
-
-singleanalysis=True #For a single aberration vector to check
-a1r = 0;      a1i = 0;      # astigmatism            (e-8)
-b2r = 0;      b2i = 0;      # coma                   (e-6)
-a2r = 0;      a2i = 0;          # 3-fold astigmatism     (e-6)
-c3  = 3e-3;                     # spherical aberration   (e-3), always > 0 in the training data
-a3r = 100e-6;      a3i = 0e-6;      # 4-fold astigmatism     (e-4)
-
-validation_analysis_vector=np.array([a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i]) #Same structure as the PSF analysis
-
-#Input-output_details
+#####Main parameters###########################################################################################
 
 n_predicted_coeffs=9 #Dimensionality of the output vector (for now this is either 3,7 or 9)
 model_name=f"CNN_iteration_3_v1_{n_predicted_coeffs}"
+file_name="psf_9coef_A1-B2-A2-C3-A3_n3000.npz" #name of the dataset you want to load
+data_folder= f'{Base_Directory}/PSF_from_Image/Data (V2 format)'
+indices_of_interest=[0,1] #Selects the images of onterest taken of the same PSF for training and evalutaion from that
+
+###Dataset generation related
+
+training_set_fraction=0.8
+validation_set_fraction=0.2
+learning_rate=0.0001
+
+
+###Functionalities
+
+train=False #To determine weights and saves the parameters
+evaluation_mode=True #Loads parameters and used for model inference
+dataset_analysis_mode=False #Used for evaluation of the dataset fed into the CNN
+valanalysis=True
+
+###Validation analyis quick inputs
+
+autosave=True #keeps images
+singleanalysis=True #For a single aberration vector to check
+
+a1r = 0;      a1i = 0;            # astigmatism            (e-8)
+b2r = 0;      b2i = 0;            # coma                   (e-6)
+a2r = 1e-6;  a2i = 1e-6;          # 3-fold astigmatism     (e-6)
+c3  = 0e-3                        # spherical aberration   (e-3)
+a3r = 0e-6;      a3i = 0e-6;      # 4-fold astigmatism     (e-4)
+
+validation_analysis_vector=np.array([a1r, a1i, b2r, b2i, a2r, a2i, c3, a3r, a3i]) #Same structure as the PSF analysis
+
+
+#####Structure of the CNN###########################################################################################
 
 image_size=128 #square images considered (imagesize x imageize)
-n_in_channels=len(psf_gen.defocus_values) #Images taken as input onto the CNN: overfocus (+5 um) and underfocus (-5 um), the dataset only has these 2
-file_name="psf_9coef_A1-B2-A2-C3-A3_n3000.npz" #name of the dataset you want to load, made with generate_psf_dataset_NEW.py
-data_folder=Base_Directory/"Data" #generate_psf_dataset_NEW.py saves its datasets here (next to itself), not in PSF_from_Image/Data
+n_in_channels=2 #Images taken as input onto the CNN
 
-#Other
+
+#Below the channels per each parallel pipeline (depthwise convolution)---
+
+#Layer 1
+n_indiv_channels_c1=32 ; n_indiv_channels_c2=32 
+kernel_c1= 4           ; kernel_c2= 8
+max_pool_1=2
+#Layer2
+n_indiv_channels_c3=32 ; n_indiv_channels_c4=32
+kernel_c3= 4           ;    kernel_c4= 4 
+max_pool_2=2
+#Dense layers
+p_dropout=0.2
+n_neurons=1000
+
+#####Other###########################################################################################
+
 n_datapoints_plotting = 100 #Number of datapoints used for plotting in total
 n_display=10#epochs between prints of losses display
-n_batch=200 #(400 in iteration 2, but that needs 6.3 GB > the 6 GB laptop GPU and runs ~5x slower) Determines batch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
-n_lowpass=1000050 #Window used for early validation stop whether the general tendency is to increaso er decrease despite noise
+n_batch=400 #Determines minibatch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+n_lowpass=15000000 #Window used for early validation stop whether the general tendency is to increase or decrease despite noise
 n_save=100 #Epochs per save made
 n_epochs=5000
 
-#Learning hyperparameters
-max_pool_1=2
-max_pool_2=2
-training_set_fraction=0.8
-validation_set_fraction=0.2
-learning_rate=0.001
+
 
 ###################################
 #Function and classes definitions
 ###################################
 
-#CNN class definition
+#CNN class definition, for this case grouped convolution is used
 class CNN(torch.nn.Module):
     def __init__(self):
 
         super(CNN,self).__init__()
-        self.conv_pass_1=torch.nn.Sequential(torch.nn.Conv2d(n_in_channels,16,(9,9),stride=1,padding="same"),torch.nn.ReLU(),torch.nn.Conv2d(16,32,(5,5),stride=1,padding="same"),torch.nn.ReLU(),torch.nn.MaxPool2d(max_pool_1)) #Yields 64x64 @ 32
-        self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(32,32,(3,3),padding="same"),torch.nn.ReLU(),torch.nn.Conv2d(32,16,(3,3),padding="same"),torch.nn.ReLU(),torch.nn.MaxPool2d(max_pool_2)) #Yields  16 @ 32x32 
-        #self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(64,32,(3,3)stride=1,padding="same"),)
-        self.dense=torch.nn.Sequential(torch.nn.Flatten(),torch.nn.Dropout(p=0.2),torch.nn.Linear(int(16*((image_size*image_size)/(max_pool_2**2*max_pool_1**2))),1000),torch.nn.ReLU(),torch.nn.Linear(1000,n_predicted_coeffs)) #All follows from max pooling reaulting size and number of channels
+        self.conv_pass_1=torch.nn.Sequential(torch.nn.Conv2d(n_in_channels,n_indiv_channels_c1,kernel_c1,padding="same"),torch.nn.Conv2d(n_indiv_channels_c1,n_indiv_channels_c2,kernel_c2,padding="same"),torch.nn.MaxPool2d(max_pool_1))
+        self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(n_indiv_channels_c2,n_indiv_channels_c3,kernel_c3,padding="same"),torch.nn.Conv2d(n_indiv_channels_c3,n_indiv_channels_c4,kernel_c4,padding="same"),torch.nn.MaxPool2d(max_pool_2))
+        self.dense=torch.nn.Sequential(torch.nn.Flatten(),torch.nn.Dropout(p=p_dropout),torch.nn.Linear(int(n_indiv_channels_c4*((image_size*image_size)/(max_pool_2**2*max_pool_1**2))),n_neurons),torch.nn.ReLU(),torch.nn.Linear(n_neurons,n_predicted_coeffs)) #All follows from max pooling reaulting size and number of channels
     
     def forward(self,x):
+
         #For forward pass
         x=self.conv_pass_1(x)
         x=self.conv_pass_2(x)
         x=self.dense(x)
         return x 
     
-
+    
+#Misc definitions for generating PSF
 
 def load_dataset(file_name):
     """Loads a dataset made by generate_psf_dataset_NEW.py and checks it has the 2 channels and the c / (high - low) labels this CNN expects."""
-    dataset=np.load(data_folder/file_name)
+    dataset=np.load(f'{data_folder}/{file_name}')
     if dataset["images"].shape[1]!=n_in_channels or not np.allclose(dataset["defocus_values"],psf_gen.defocus_values):
         raise ValueError(f"{file_name} has defocus channels {dataset['defocus_values']}, expected {psf_gen.defocus_values}: "
                          "it was made with the old generator, regenerate it with generate_psf_dataset_NEW.py")
@@ -312,7 +333,7 @@ if evaluation_mode:
         ref=labels_to_meters(vectors[imidx:],ranges) #The validation labels (same samples as the input above)
 
         
-        relative_error=(out-ref)/ref*100 #% Note the size of this, it will be (datasetsize-imidx,Ncoeffs)
+        relative_error=(out-ref)/ref #% Note the size of this, it will be (datasetsize-imidx,Ncoeffs)
         relative_error=relative_error.detach().numpy()
         mean_relative_error=np.mean(relative_error,axis=0)
 
@@ -324,7 +345,8 @@ if evaluation_mode:
 
         plt.plot(range(np.shape(relative_error)[0]),np.mean(relative_error,axis=1))
         plt.xlabel("Sample index")
-        plt.ylabel("Mean of error vector")
+        plt.ylabel("Mean of relative error vector")
+        
         plt.show()
 
 
@@ -333,7 +355,7 @@ if evaluation_mode:
 
     
         ###Analysis of single PSF's performance by the CNN
-        os.makedirs(f"{Base_Directory}/ConvolutionalNeural_Net_Iter.3/Analysis",exist_ok=True) #Empty folders are not kept by git
+        os.makedirs(f"{Base_Directory}/ConvolutionalNeural_Net_Iter.3/Analysis",exist_ok=True) 
 
 
         input=make_cnn_input(validation_analysis_vector) #Size should be correct, (1,2,128,128) for the resolutions studied
