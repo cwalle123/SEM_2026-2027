@@ -56,3 +56,6 @@ Validation_loss=0.0005967800971120596
 <img width="1881" height="927" alt="image" src="https://github.com/user-attachments/assets/63a68d9c-913b-440e-a0cf-e64550bef3e9" />
 
 ### Version V2
+
+Increased the number of filters on the first layer to make curvature detection more precise and thus reduce A2 and A3 errors. The learning rate was kept constant.
+
