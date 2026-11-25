@@ -53,6 +53,9 @@ validation_set_fraction=0.2
 learning_rate=0.001
 ```
 
+<img width="1910" height="962" alt="image" src="https://github.com/user-attachments/assets/39381ae0-b34c-4249-b1af-5caf4312c243" />
+
+
 # Examples of V3 version results on _validaton_ set
 <img width="1600" height="759" alt="image" src="https://github.com/user-attachments/assets/6dc09c25-4b43-4a17-841d-2b10c3dd641c" />
 <img width="1600" height="739" alt="image" src="https://github.com/user-attachments/assets/c38b4b1c-6089-401e-8cee-770229082e18" />
