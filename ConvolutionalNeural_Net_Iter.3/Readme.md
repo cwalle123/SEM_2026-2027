@@ -18,7 +18,7 @@ image_size=128 #square images considered (imagesize x imageize)
 n_in_channels=2 #Images taken as input onto the CNN
 
 
-#Below the channels per each parallel pipeline (depthwise convolution)---
+#Below the channels per layer
 
 #Layer 1
 n_indiv_channels_c1=32 ; n_indiv_channels_c2=32 
@@ -31,6 +31,14 @@ max_pool_2=2
 #Dense layers
 p_dropout=0.2
 n_neurons=1000
+
+#Dataset generation related
+
+n_batch=400 #Determines minibatch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+training_set_fraction=0.8
+validation_set_fraction=0.2
+learning_rate=0.0001
+
 ```
 
 With the last reported values for training and validation shown below
@@ -57,7 +65,83 @@ Validation_loss=0.0005967800971120596
 
 ### Version V2
 
-Increased the number of filters on the first layer to make curvature detection more precise and thus reduce A2 and A3 errors. The learning rate was kept constant. The structure looks as follows:
+This ersion uses again the samse strucure as the V3 from iteration 2, to check whether the different structure of the CNN improoved generalisation performance or whether it was related to the normalisation changes as well as the larger dataset.
+
+Training is as fast as in the iter.2 while it tends to behave almost equally to the iter.2. A minimum validation lower than before is observed with the new dataset (both size and new normalisation), reaching validation losses of around 0.008 as minimum during training. Further iterations reach also an asymptotic value for the training loss, at around 0.0007, shich is above the previous training errors. Therefore, it is thought that the previous iterartion's structure is too simple to grasp detailed features of the PSFs. Even if the lr is reduced, same behaviour is obseved
+
+The structure used is then:
+
+```ruby
+image_size=128 #square images considered (imagesize x imageize)
+n_in_channels=2 #Images taken as input onto the CNN
+
+
+#Layer 1
+n_indiv_channels_c1=16 ; n_indiv_channels_c2=32 
+kernel_c1= 9           ; kernel_c2= 5
+max_pool_1=2
+#Layer2
+n_indiv_channels_c3=32 ; n_indiv_channels_c4=16
+kernel_c3= 3           ;    kernel_c4= 3
+max_pool_2=2
+#Dense layers
+p_dropout=0.2
+n_neurons=1000
+
+#Dataset generation related
+
+n_batch=400 #Determines minibatch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+training_set_fraction=0.8
+validation_set_fraction=0.2
+learning_rate=0.0001
+```
+
+### Version V3
+
+In this version inishgts gained from the V2 were used. Therefore, increasing model complexity will tend to decrease both validation and training errors by a lager significant factor than could training set conditioning as well as size. 
+
+The structure used will increase the number of channles and kernel size for the first layer (trying to reserve it for filters used primary fueature detection, such as edge and curvature detection) to increase the resolution of the angles and features different filters (or kernels) could distinguish. This is mainly based on the results of the V1, where the features which require precise measurements of curvature and slope of the PSF contour are required.
+
+kenel size is also increased slightly to allow for better resolution filters (which is required if we increase channels for more precise feature extractions). Note for this try, I'm trying to force CNN to use furst layer for edge detection, so if 8x8 kervel only about 8-10 different angled may be distinguished and thus only 8-10 filters (and then channels would be required)
+
+Also maxpooling dimension is chosen to improove the span of the second-layer kernel, to be able to determine less localised features.
+
+Poor performance seen, minimum loss of around 0.01...
+
+```ruby
+image_size=128 #square images considered (imagesize x imageize)
+n_in_channels=2 #Images taken as input onto the CNN
+
+
+#Below the channels per layer
+
+#Layer 1
+n_indiv_channels_c1=8 ; n_indiv_channels_c2=32 
+kernel_c1= 8           ; kernel_c2= 8
+max_pool_1=4
+#Layer2
+n_indiv_channels_c3=32 ; n_indiv_channels_c4=32
+kernel_c3= 4           ;    kernel_c4= 4 
+max_pool_2=4
+#Dense layers
+p_dropout=0.2
+n_neurons=1000
+
+#Dataset generation related
+
+n_batch=400 #Determines minibatch size (number of samples the CNN runs over in one epoch), neeeds to be smaller than the traininig set.
+training_set_fraction=0.8
+validation_set_fraction=0.2
+learning_rate=0.0001
+```
+
+## V3 With ReLu, apparently previous CNNs did not haev relu from the iteration 3...
+
+### Version V4
+
+Read a bit more about CNN training
+https://github.com/Saibhossain/pytorch-foundations-and-projects/blob/main/Visualizing_and_interpreting.ipynb
+https://arxiv.org/abs/1512.03385 -- Resnet achitecture nice to know bout for similarlty sized samples
 
 
 
