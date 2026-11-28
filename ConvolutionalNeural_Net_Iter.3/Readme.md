@@ -7,6 +7,39 @@ Same network and settings as iteration 2 (copied from it), adapted to datasets m
 - **Data folder:** the datasets are loaded from `Data/` in the repository root (where `generate_psf_dataset_NEW.py` saves them). Datasets made with the old generator are refused, because they have 3 channels and the old [−1, 1] labels.
 - **Single-vector analysis** makes its PSFs with `generate_psf_dataset_NEW.py` directly (no `psf_viewer`).
 
+
+
+<details>
+
+<summary>(for the first 1 version, no ReLU.... )</summary>
+
+```
+class CNN(torch.nn.Module):
+    def __init__(self):
+
+        super(CNN,self).__init__()
+        self.conv_pass_1=torch.nn.Sequential(torch.nn.Conv2d(n_in_channels,n_indiv_channels_c1,kernel_c1,padding="same"),torch.nn.Conv2d(n_indiv_channels_c1,n_indiv_channels_c2,kernel_c2,padding="same"),torch.nn.MaxPool2d(max_pool_1))
+        self.conv_pass_2=torch.nn.Sequential(torch.nn.Conv2d(n_indiv_channels_c2,n_indiv_channels_c3,kernel_c3,padding="same"),torch.nn.Conv2d(n_indiv_channels_c3,n_indiv_channels_c4,kernel_c4,padding="same"),torch.nn.MaxPool2d(max_pool_2))
+        self.dense=torch.nn.Sequential(torch.nn.Flatten(),torch.nn.Dropout(p=p_dropout),torch.nn.Linear(int(n_indiv_channels_c4*((image_size*image_size)/(max_pool_2**2*max_pool_1**2))),n_neurons),torch.nn.ReLU(),torch.nn.Linear(n_neurons,n_predicted_coeffs)) #All follows from max pooling reaulting size and number of channels
+    
+    def forward(self,x):
+
+        #For forward pass
+        x=self.conv_pass_1(x)
+        x=self.conv_pass_2(x)
+        x=self.dense(x)
+        return x
+    
+    def partial_output(self,x):#this function is only defined to check feature maps extracted from the CNN once trained, avoinds undoing other shennanigans
+
+        temp=self.conv_pass_1[0](x)
+        x=self.conv_pass_1[1](temp)
+
+
+        return x #This is what we want
+```
+</details>
+
 ## Version V1
 
 Version V1 plays around with some hyperparameters, and changing the kernel sizes wrt to the previous CNN iteration to increase generalisation performance and also simplified the structure of the CNN (removing one conv. layer to also improove generalisation performance).
@@ -65,11 +98,9 @@ Validation_loss=0.0005967800971120596
 
 ### Version V2
 
-This ersion uses again the samse strucure as the V3 from iteration 2, to check whether the different structure of the CNN improoved generalisation performance or whether it was related to the normalisation changes as well as the larger dataset.
+This version uses again the same strucure as the V3 from iteration 2, to check whether the different structure of the CNN improoved generalisation performance or whether it was related to the normalisation changes as well as the larger dataset.
 
-Training is as fast as in the iter.2 while it tends to behave almost equally to the iter.2. A minimum validation lower than before is observed with the new dataset (both size and new normalisation), reaching validation losses of around 0.008 as minimum during training. Further iterations reach also an asymptotic value for the training loss, at around 0.0007, shich is above the previous training errors. Therefore, it is thought that the previous iterartion's structure is too simple to grasp detailed features of the PSFs. Even if the lr is reduced, same behaviour is obseved
-
-The structure used is then:
+Training is as fast as in the iter.2 while it tends to behave almost equally to the iter.2. A minimum validation much lower than before is observed with the new dataset (both size and new normalisation), with validation losses below 0.007 as mean 
 
 ```ruby
 image_size=128 #square images considered (imagesize x imageize)
@@ -98,11 +129,11 @@ learning_rate=0.0001
 
 ### Version V3
 
-In this version inishgts gained from the V2 were used. Therefore, increasing model complexity will tend to decrease both validation and training errors by a lager significant factor than could training set conditioning as well as size. 
+In this version insights gained from the V2 were used. Therefore,for now increasing model complexity will tend to decrease both validation and training errors by a lager significant factor than could training set conditioning as well as size. 
 
-The structure used will increase the number of channles and kernel size for the first layer (trying to reserve it for filters used primary fueature detection, such as edge and curvature detection) to increase the resolution of the angles and features different filters (or kernels) could distinguish. This is mainly based on the results of the V1, where the features which require precise measurements of curvature and slope of the PSF contour are required.
+The structure used will increase the number of channles and kernel size for the first layer (trying to reserve it for filters used primary fueature detection, such as edge and curvature detection and maybe gradient) to increase the resolution of the angles and features different filters (or kernels) could distinguish. This is mainly based on the results of the V1, where the features which require precise measurements of curvature and slope of the PSF contour are required.
 
-kenel size is also increased slightly to allow for better resolution filters (which is required if we increase channels for more precise feature extractions). Note for this try, I'm trying to force CNN to use furst layer for edge detection, so if 8x8 kervel only about 8-10 different angled may be distinguished and thus only 8-10 filters (and then channels would be required)
+kenel size is also increased slightly to allow for better resolution filters (which is required if we increase channels for more precise feature extractions). Note for this try, I'm trying to force CNN to use furst layer for edge detection, so if 8x8 kervel only about 8-10 different angles may be distinguished and thus only 8-10 filters (and then channels would be required)
 
 Also maxpooling dimension is chosen to improove the span of the second-layer kernel, to be able to determine less localised features.
 
@@ -134,8 +165,6 @@ training_set_fraction=0.8
 validation_set_fraction=0.2
 learning_rate=0.0001
 ```
-
-## V3 With ReLu, apparently previous CNNs did not haev relu from the iteration 3...
 
 ### Version V4
 
