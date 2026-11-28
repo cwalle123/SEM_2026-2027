@@ -57,5 +57,7 @@ Validation_loss=0.0005967800971120596
 
 ### Version V2
 
-Increased the number of filters on the first layer to make curvature detection more precise and thus reduce A2 and A3 errors. The learning rate was kept constant.
+Increased the number of filters on the first layer to make curvature detection more precise and thus reduce A2 and A3 errors. The learning rate was kept constant. The structure looks as follows:
+
+
 
